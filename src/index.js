@@ -22,11 +22,13 @@ const DEFAULT_RESERVED_SLUGS = [
 
 const SESSION_COOKIE = "stublogs_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
+const DEFAULT_API_ENTRY_SLUG = "app";
+const SITE_CONFIG_VERSION = 2;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request, env, ctx);
     } catch (error) {
       console.error("Unhandled error", error);
       return json({ error: "Internal server error" }, 500);
@@ -128,12 +130,15 @@ export function slugifyValue(value) {
     .slice(0, 80);
 }
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = normalizePath(url.pathname);
   const hostHeader = request.headers.get("host") || url.host;
   const hostname = hostHeader.split(":")[0].toLowerCase();
   const baseDomain = String(env.BASE_DOMAIN || "bdfz.net").toLowerCase();
+  const apiEntrySlug = String(env.API_ENTRY_SLUG || DEFAULT_API_ENTRY_SLUG)
+    .trim()
+    .toLowerCase();
   const hostSlug = getHostSlug(hostname, baseDomain);
   const reservedSlugs = getReservedSlugs(env);
 
@@ -146,12 +151,13 @@ async function handleRequest(request, env) {
       return buildApiPreflightResponse(request, env);
     }
 
-    const response = await handleApi(request, env, {
+    const response = await handleApi(request, env, ctx, {
       path,
       url,
       hostSlug,
       baseDomain,
       reservedSlugs,
+      apiEntrySlug,
     });
     return withCors(response, request, env);
   }
@@ -179,7 +185,7 @@ async function handleRequest(request, env) {
     return notFound();
   }
 
-  if (reservedSlugs.has(hostSlug)) {
+  if (reservedSlugs.has(hostSlug) && hostSlug !== apiEntrySlug) {
     // Reserved slugs are owned by platform/system services.
     // Let Cloudflare continue to the configured origin for those hosts.
     return fetch(request);
@@ -196,12 +202,19 @@ async function handleRequest(request, env) {
 
   if (path === "/admin") {
     const authed = await isSiteAuthenticated(request, env, site.slug);
-    return html(renderAdminPage(site, authed, baseDomain), 200);
+    const siteConfig = await getSiteConfig(env, site);
+    return html(renderAdminPage(site, siteConfig, authed, baseDomain), 200);
   }
 
   if (path === "/") {
     const posts = await listPosts(env, site.id, false);
-    return html(renderSiteHomePage(site, posts, baseDomain), 200);
+    const siteConfig = await getSiteConfig(env, site);
+    const communitySites = await listCommunitySites(env, site.slug, 12);
+    const campusFeed = await listCampusFeed(env, site.id, 18);
+    return html(
+      renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed, baseDomain),
+      200
+    );
   }
 
   if (path === "/robots.txt") {
@@ -224,12 +237,14 @@ async function handleRequest(request, env) {
     return notFound("Post content missing");
   }
 
+  const siteConfig = await getSiteConfig(env, site);
+  const communitySites = await listCommunitySites(env, site.slug, 8);
   const articleHtml = renderMarkdown(file.content);
-  return html(renderPostPage(site, post, articleHtml, baseDomain), 200);
+  return html(renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain), 200);
 }
 
-async function handleApi(request, env, context) {
-  const { path, url, hostSlug, baseDomain, reservedSlugs } = context;
+async function handleApi(request, env, ctx, context) {
+  const { path, url, hostSlug, baseDomain, reservedSlugs, apiEntrySlug } = context;
 
   if (request.method === "GET" && path === "/api/check-slug") {
     const slug = String(url.searchParams.get("slug") || "")
@@ -246,6 +261,30 @@ async function handleApi(request, env, context) {
     }
 
     return json({ available: true }, 200);
+  }
+
+  if (request.method === "GET" && path === "/api/public-sites") {
+    const sites = await listPublicSites(env, 1000);
+    return json(
+      {
+        generatedAt: new Date().toISOString(),
+        total: sites.length,
+        sites,
+      },
+      200
+    );
+  }
+
+  if (request.method === "GET" && path === "/api/public-feed") {
+    const feed = await listCampusFeed(env, null, 80);
+    return json(
+      {
+        generatedAt: new Date().toISOString(),
+        total: feed.length,
+        posts: feed,
+      },
+      200
+    );
   }
 
   if (request.method === "POST" && path === "/api/register") {
@@ -268,7 +307,7 @@ async function handleApi(request, env, context) {
       return json({ error: "Invalid invite code" }, 403);
     }
 
-    if (hostSlug && !reservedSlugs.has(hostSlug) && slug !== hostSlug) {
+    if (hostSlug && hostSlug !== apiEntrySlug && !reservedSlugs.has(hostSlug) && slug !== hostSlug) {
       return json({ error: "Slug must match current hostname" }, 400);
     }
 
@@ -305,13 +344,28 @@ async function handleApi(request, env, context) {
       }
 
       const siteConfig = JSON.stringify(
-        {
-          slug,
-          displayName,
-          description,
-          createdAt: now,
-          exportVersion: 1,
-        },
+        normalizeSiteConfig(
+          {
+            slug,
+            displayName,
+            description,
+            heroTitle: "",
+            heroSubtitle: "",
+            accentColor: "#7b5034",
+            footerNote: "在這裡，把語文寫成你自己。",
+            headerLinks: [],
+            createdAt: now,
+            updatedAt: now,
+            exportVersion: SITE_CONFIG_VERSION,
+          },
+          {
+            slug,
+            displayName,
+            description,
+            createdAt: now,
+            updatedAt: now,
+          }
+        ),
         null,
         2
       );
@@ -341,6 +395,21 @@ async function handleApi(request, env, context) {
         now,
         now
       );
+
+      const notifyTask = notifyTelegramNewSite(env, {
+        slug,
+        displayName,
+        siteUrl: `https://${slug}.${baseDomain}`,
+        createdAt: now,
+      }).catch((error) => {
+        console.error("Telegram notify failed", error);
+      });
+
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(notifyTask);
+      } else {
+        await notifyTask;
+      }
     } catch (error) {
       console.error("Failed to register site", error);
 
@@ -367,6 +436,104 @@ async function handleApi(request, env, context) {
         siteUrl: `https://${slug}.${baseDomain}`,
       },
       201
+    );
+  }
+
+  if (request.method === "GET" && path === "/api/site-settings") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const config = await getSiteConfig(env, site);
+    return json({ site: formatSiteForClient(site), config }, 200);
+  }
+
+  if (request.method === "POST" && path === "/api/site-settings") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const body = await readJson(request);
+    const now = new Date().toISOString();
+
+    const displayName = sanitizeName(body.displayName || site.displayName) || site.slug;
+    const description = sanitizeDescription(body.description || "");
+    const heroTitle = sanitizeTitle(body.heroTitle || "");
+    const heroSubtitle = sanitizeDescription(body.heroSubtitle || "");
+    const accentColor = sanitizeHexColor(body.accentColor || "#7b5034");
+    const footerNote = sanitizeDescription(body.footerNote || "");
+    const headerLinks = sanitizeHeaderLinks(body.headerLinks);
+
+    const nextConfig = normalizeSiteConfig(
+      {
+        slug: site.slug,
+        displayName,
+        description,
+        heroTitle,
+        heroSubtitle,
+        accentColor,
+        footerNote,
+        headerLinks,
+        createdAt: site.createdAt,
+        updatedAt: now,
+      },
+      site
+    );
+
+    try {
+      await env.DB.prepare(
+        `UPDATE sites
+         SET display_name = ?, description = ?, updated_at = ?
+         WHERE id = ?`
+      )
+        .bind(displayName, description, now, site.id)
+        .run();
+
+      await githubWriteFile(
+        env,
+        getSiteConfigPath(site.slug),
+        `${JSON.stringify(nextConfig, null, 2)}\n`,
+        `feat(${site.slug}): update site settings`
+      );
+    } catch (error) {
+      console.error("Failed to save site settings", error);
+      return json(
+        {
+          error: "Failed to save site settings",
+          detail: String(error && error.message ? error.message : error),
+        },
+        502
+      );
+    }
+
+    const updatedSite = await getSiteBySlug(env, site.slug);
+    return json(
+      {
+        ok: true,
+        site: formatSiteForClient(updatedSite || site),
+        config: nextConfig,
+      },
+      200
     );
   }
 
@@ -576,6 +743,7 @@ async function handleApi(request, env, context) {
     }
 
     const posts = await listPosts(env, site.id, true);
+    const config = await getSiteConfig(env, site);
     const exportedPosts = [];
 
     for (const post of posts) {
@@ -594,6 +762,7 @@ async function handleApi(request, env, context) {
         description: site.description,
         createdAt: site.createdAt,
       },
+      config,
       posts: exportedPosts,
     };
 
@@ -626,6 +795,126 @@ async function getSiteBySlug(env, slug) {
   )
     .bind(slug)
     .first();
+}
+
+function formatSiteForClient(site) {
+  if (!site) {
+    return null;
+  }
+
+  return {
+    id: site.id,
+    slug: site.slug,
+    displayName: site.displayName,
+    description: site.description,
+    createdAt: site.createdAt,
+    updatedAt: site.updatedAt,
+    url: `https://${site.slug}.bdfz.net`,
+  };
+}
+
+async function listPublicSites(env, limit = 500) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 1000);
+  const result = await env.DB.prepare(
+    `SELECT
+      s.slug AS slug,
+      s.display_name AS displayName,
+      s.description AS description,
+      s.created_at AS createdAt,
+      s.updated_at AS updatedAt,
+      (
+        SELECT COUNT(*)
+        FROM posts p
+        WHERE p.site_id = s.id AND p.published = 1
+      ) AS postCount
+    FROM sites s
+    ORDER BY s.created_at DESC
+    LIMIT ?`
+  )
+    .bind(safeLimit)
+    .all();
+
+  const rows = result.results || [];
+  return rows.map((site) => ({
+    slug: site.slug,
+    displayName: site.displayName,
+    description: site.description || "",
+    createdAt: site.createdAt,
+    updatedAt: site.updatedAt,
+    postCount: Number(site.postCount || 0),
+    url: `https://${site.slug}.bdfz.net`,
+  }));
+}
+
+async function listCommunitySites(env, currentSlug, limit = 12) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 12, 1), 60);
+  const result = await env.DB.prepare(
+    `SELECT
+      slug,
+      display_name AS displayName,
+      description,
+      created_at AS createdAt
+    FROM sites
+    WHERE slug != ?
+    ORDER BY created_at DESC
+    LIMIT ?`
+  )
+    .bind(currentSlug, safeLimit)
+    .all();
+
+  const rows = result.results || [];
+  return rows.map((site) => ({
+    slug: site.slug,
+    displayName: site.displayName,
+    description: site.description || "",
+    createdAt: site.createdAt,
+    url: `https://${site.slug}.bdfz.net`,
+  }));
+}
+
+async function listCampusFeed(env, excludeSiteId = null, limit = 24) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 24, 1), 120);
+  const sql = excludeSiteId
+    ? `SELECT
+        p.post_slug AS postSlug,
+        p.title AS title,
+        p.description AS description,
+        p.updated_at AS updatedAt,
+        s.slug AS siteSlug,
+        s.display_name AS siteName
+      FROM posts p
+      INNER JOIN sites s ON p.site_id = s.id
+      WHERE p.published = 1 AND p.site_id != ?
+      ORDER BY p.updated_at DESC
+      LIMIT ?`
+    : `SELECT
+        p.post_slug AS postSlug,
+        p.title AS title,
+        p.description AS description,
+        p.updated_at AS updatedAt,
+        s.slug AS siteSlug,
+        s.display_name AS siteName
+      FROM posts p
+      INNER JOIN sites s ON p.site_id = s.id
+      WHERE p.published = 1
+      ORDER BY p.updated_at DESC
+      LIMIT ?`;
+
+  const statement = excludeSiteId
+    ? env.DB.prepare(sql).bind(excludeSiteId, safeLimit)
+    : env.DB.prepare(sql).bind(safeLimit);
+  const result = await statement.all();
+  const rows = result.results || [];
+
+  return rows.map((post) => ({
+    siteSlug: post.siteSlug,
+    siteName: post.siteName,
+    postSlug: post.postSlug,
+    title: post.title,
+    description: post.description || "",
+    updatedAt: post.updatedAt,
+    url: `https://${post.siteSlug}.bdfz.net/${post.postSlug}`,
+  }));
 }
 
 async function listPosts(env, siteId, includeDrafts = false) {
@@ -811,6 +1100,174 @@ function getSiteConfigPath(siteSlug) {
 
 function getPostFilePath(siteSlug, postSlug) {
   return `sites/${siteSlug}/posts/${postSlug}.md`;
+}
+
+function defaultSiteConfigFromSite(site) {
+  return normalizeSiteConfig(
+    {
+      slug: site.slug,
+      displayName: site.displayName,
+      description: site.description || "",
+      heroTitle: "",
+      heroSubtitle: "",
+      accentColor: "#7b5034",
+      footerNote: "在這裡，把語文寫成你自己。",
+      headerLinks: [],
+      createdAt: site.createdAt || new Date().toISOString(),
+      updatedAt: site.updatedAt || new Date().toISOString(),
+      exportVersion: SITE_CONFIG_VERSION,
+    },
+    site
+  );
+}
+
+function sanitizeHexColor(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (/^#[0-9a-f]{6}$/.test(raw)) {
+    return raw;
+  }
+
+  if (/^#[0-9a-f]{3}$/.test(raw)) {
+    return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`;
+  }
+
+  return "#7b5034";
+}
+
+function sanitizeHeaderLinks(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .slice(0, 8)
+    .map((item) => ({
+      label: sanitizeName(item?.label || "").slice(0, 24),
+      url: sanitizeUrl(item?.url || ""),
+    }))
+    .filter((item) => item.label && item.url);
+}
+
+function sanitizeUrl(value) {
+  const url = String(value || "").trim();
+  if (!url) {
+    return "";
+  }
+
+  if (/^https?:\/\//i.test(url)) {
+    return url.slice(0, 240);
+  }
+
+  return "";
+}
+
+function normalizeSiteConfig(rawConfig, site) {
+  const base = site
+    ? defaultSiteConfigFromSiteBase(site)
+    : {
+        slug: "",
+        displayName: "",
+        description: "",
+        heroTitle: "",
+        heroSubtitle: "",
+        accentColor: "#7b5034",
+        footerNote: "在這裡，把語文寫成你自己。",
+        headerLinks: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        exportVersion: SITE_CONFIG_VERSION,
+      };
+
+  const merged = {
+    ...base,
+    ...(rawConfig && typeof rawConfig === "object" ? rawConfig : {}),
+  };
+
+  return {
+    slug: String(merged.slug || base.slug).toLowerCase(),
+    displayName: sanitizeName(merged.displayName || base.displayName) || base.slug,
+    description: sanitizeDescription(merged.description || ""),
+    heroTitle: sanitizeTitle(merged.heroTitle || ""),
+    heroSubtitle: sanitizeDescription(merged.heroSubtitle || ""),
+    accentColor: sanitizeHexColor(merged.accentColor || base.accentColor),
+    footerNote: sanitizeDescription(merged.footerNote || base.footerNote),
+    headerLinks: sanitizeHeaderLinks(Array.isArray(merged.headerLinks) ? merged.headerLinks : []),
+    createdAt: String(merged.createdAt || base.createdAt),
+    updatedAt: String(merged.updatedAt || new Date().toISOString()),
+    exportVersion: SITE_CONFIG_VERSION,
+  };
+}
+
+function defaultSiteConfigFromSiteBase(site) {
+  return {
+    slug: site.slug,
+    displayName: site.displayName || site.slug,
+    description: site.description || "",
+    heroTitle: "",
+    heroSubtitle: "",
+    accentColor: "#7b5034",
+    footerNote: "在這裡，把語文寫成你自己。",
+    headerLinks: [],
+    createdAt: site.createdAt || new Date().toISOString(),
+    updatedAt: site.updatedAt || new Date().toISOString(),
+    exportVersion: SITE_CONFIG_VERSION,
+  };
+}
+
+async function getSiteConfig(env, site) {
+  const fallback = defaultSiteConfigFromSite(site);
+  const filePath = getSiteConfigPath(site.slug);
+
+  try {
+    const file = await githubReadFile(env, filePath);
+    if (!file || !file.content) {
+      return fallback;
+    }
+
+    const parsed = JSON.parse(file.content);
+    return normalizeSiteConfig(parsed, site);
+  } catch (error) {
+    console.error("Failed to load site config", error);
+    return fallback;
+  }
+}
+
+async function notifyTelegramNewSite(env, payload) {
+  const botToken = String(env.TELEGRAM_BOT_TOKEN || "").trim();
+  const chatId = String(env.TELEGRAM_CHAT_ID || "").trim();
+
+  if (!botToken || !chatId) {
+    return;
+  }
+
+  const lines = [
+    "🆕 新 Blog 註冊",
+    `站點：${payload.slug}.bdfz.net`,
+    `名稱：${payload.displayName}`,
+    `時間：${payload.createdAt}`,
+    `後台：${payload.siteUrl}/admin`,
+  ];
+
+  const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: lines.join("\n"),
+      disable_web_page_preview: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Telegram notify failed: ${response.status} ${detail}`);
+  }
 }
 
 async function createPasswordHash(password, env) {
@@ -1155,7 +1612,7 @@ function renderRootPage(baseDomain) {
     `
     <section class="panel">
       <p class="eyebrow">bdfz.net student blogs</p>
-      <h1>開一個 ${escapeHtml(baseDomain)} 子域名 Blog</h1>
+      <h1>所謂語文，無非你寫。</h1>
       <p class="muted">每位學生可選擇自己的 <code>xxx</code>，站點會是 <code>https://xxx.${escapeHtml(baseDomain)}</code>。</p>
 
       <form id="register-form" class="stack" autocomplete="off">
@@ -1355,7 +1812,22 @@ function renderRootAdminHelp(baseDomain) {
   );
 }
 
-function renderSiteHomePage(site, posts, baseDomain) {
+function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed, baseDomain) {
+  const heading = siteConfig.heroTitle || site.displayName;
+  const subtitle = siteConfig.heroSubtitle || site.description || "";
+  const accentStyle = `--accent:${escapeHtml(siteConfig.accentColor)};`;
+
+  const navLinks = (siteConfig.headerLinks || []).length
+    ? `<nav class="site-nav">${siteConfig.headerLinks
+        .map(
+          (item) =>
+            `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+              item.label
+            )}</a>`
+        )
+        .join("")}</nav>`
+    : "";
+
   const list = posts.length
     ? posts
         .map(
@@ -1370,42 +1842,101 @@ function renderSiteHomePage(site, posts, baseDomain) {
         .join("\n")
     : `<p class="muted">還沒有已發佈文章。</p>`;
 
+  const peerSites = communitySites.length
+    ? communitySites
+        .map(
+          (peer) =>
+            `<li><a href="${escapeHtml(peer.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+              peer.displayName
+            )}</a><span class="muted"> · ${escapeHtml(peer.slug)}.bdfz.net</span></li>`
+        )
+        .join("")
+    : `<li class="muted">暫時沒有其他同學站點。</li>`;
+
+  const feedItems = campusFeed.length
+    ? campusFeed
+        .map(
+          (entry) =>
+            `<li><a href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+              entry.title
+            )}</a><span class="muted"> · ${escapeHtml(entry.siteName)}</span></li>`
+        )
+        .join("")
+    : `<li class="muted">全校文章流暫時為空。</li>`;
+
   return renderLayout(
     site.displayName,
     `
-    <section class="panel wide">
+    <section class="panel wide site-home-shell" style="${accentStyle}">
       <header class="site-header">
         <div>
           <p class="eyebrow">${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
-          <h1>${escapeHtml(site.displayName)}</h1>
-          <p class="muted">${escapeHtml(site.description || "")}</p>
+          <h1>${escapeHtml(heading)}</h1>
+          <p class="muted">${escapeHtml(subtitle)}</p>
         </div>
-        <a class="link-button" href="/admin">Admin</a>
+        <div class="row-actions">
+          <a class="link-button" href="/admin">Admin</a>
+        </div>
       </header>
+      ${navLinks}
 
-      <ul class="post-list">
-        ${list}
-      </ul>
+      <div class="community-grid">
+        <section>
+          <h2>文章</h2>
+          <ul class="post-list">
+            ${list}
+          </ul>
+        </section>
+        <aside class="community-panel">
+          <h3>同學新站</h3>
+          <ul class="mini-list">${peerSites}</ul>
+          <h3>全校最新文章</h3>
+          <ul class="mini-list">${feedItems}</ul>
+        </aside>
+      </div>
+
+      <footer class="site-footer muted">${escapeHtml(
+        siteConfig.footerNote || "在這裡，把語文寫成你自己。"
+      )}</footer>
     </section>
   `
   );
 }
 
-function renderPostPage(site, post, articleHtml, baseDomain) {
+function renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain) {
+  const peerSites = communitySites.length
+    ? communitySites
+        .map(
+          (peer) =>
+            `<li><a href="${escapeHtml(peer.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+              peer.displayName
+            )}</a></li>`
+        )
+        .join("")
+    : `<li class="muted">暫時沒有其他同學站點。</li>`;
+
   return renderLayout(
     `${post.title} - ${site.displayName}`,
     `
-    <article class="panel wide article">
-      <p class="eyebrow"><a href="/">← ${escapeHtml(site.displayName)}</a> · ${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
-      <h1>${escapeHtml(post.title)}</h1>
-      <p class="muted">${escapeHtml(formatDate(post.updatedAt))}</p>
-      <div class="article-body">${articleHtml}</div>
-    </article>
+    <section class="panel wide article-wrap" style="--accent:${escapeHtml(siteConfig.accentColor)};">
+      <article class="article">
+        <p class="eyebrow"><a href="/">← ${escapeHtml(site.displayName)}</a> · ${escapeHtml(
+          site.slug
+        )}.${escapeHtml(baseDomain)}</p>
+        <h1>${escapeHtml(post.title)}</h1>
+        <p class="muted">${escapeHtml(formatDate(post.updatedAt))}</p>
+        <div class="article-body">${articleHtml}</div>
+      </article>
+      <aside class="article-side">
+        <h3>同學站點</h3>
+        <ul class="mini-list">${peerSites}</ul>
+      </aside>
+    </section>
   `
   );
 }
 
-function renderAdminPage(site, authed, baseDomain) {
+function renderAdminPage(site, siteConfig, authed, baseDomain) {
   if (!authed) {
     return renderLayout(
       `${site.displayName} Admin`,
@@ -1465,11 +1996,11 @@ function renderAdminPage(site, authed, baseDomain) {
   return renderLayout(
     `${site.displayName} Admin`,
     `
-    <section class="panel wide admin-shell">
+    <section class="panel wide admin-shell" style="--accent:${escapeHtml(siteConfig.accentColor)};">
       <header class="site-header">
         <div>
           <p class="eyebrow">editor</p>
-          <h1>${escapeHtml(site.displayName)}</h1>
+          <h1>${escapeHtml(siteConfig.heroTitle || site.displayName)}</h1>
           <p class="muted">${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
         </div>
         <div class="row-actions">
@@ -1481,6 +2012,23 @@ function renderAdminPage(site, authed, baseDomain) {
 
       <div class="admin-grid">
         <aside class="admin-list">
+          <p class="muted">Site Settings</p>
+          <label>顯示名稱</label>
+          <input id="siteDisplayName" maxlength="60" />
+          <label>站點簡介</label>
+          <input id="siteDescription" maxlength="240" />
+          <label>首頁標題</label>
+          <input id="siteHeroTitle" maxlength="120" />
+          <label>首頁副標</label>
+          <input id="siteHeroSubtitle" maxlength="240" />
+          <label>主色</label>
+          <input id="siteAccentColor" maxlength="7" placeholder="#7b5034" />
+          <label>頁尾文字</label>
+          <input id="siteFooterNote" maxlength="240" />
+          <label>外部連結（每行：標題|https://url）</label>
+          <textarea id="siteHeaderLinks" class="small-textarea" placeholder="作品集|https://example.com"></textarea>
+          <button id="save-settings" type="button">儲存站點設定</button>
+
           <p class="muted">Posts</p>
           <ul id="post-list"></ul>
         </aside>
@@ -1514,12 +2062,21 @@ function renderAdminPage(site, authed, baseDomain) {
     </section>
 
     <script>
+      const initialConfig = ${toScriptJson(siteConfig)};
       const state = {
         currentSlug: '',
         posts: [],
+        siteConfig: initialConfig,
       };
 
       const postList = document.getElementById('post-list');
+      const siteDisplayNameInput = document.getElementById('siteDisplayName');
+      const siteDescriptionInput = document.getElementById('siteDescription');
+      const siteHeroTitleInput = document.getElementById('siteHeroTitle');
+      const siteHeroSubtitleInput = document.getElementById('siteHeroSubtitle');
+      const siteAccentColorInput = document.getElementById('siteAccentColor');
+      const siteFooterNoteInput = document.getElementById('siteFooterNote');
+      const siteHeaderLinksInput = document.getElementById('siteHeaderLinks');
       const titleInput = document.getElementById('title');
       const postSlugInput = document.getElementById('postSlug');
       const descriptionInput = document.getElementById('description');
@@ -1544,6 +2101,107 @@ function renderAdminPage(site, authed, baseDomain) {
           .slice(0, 80);
       }
 
+      function normalizeHexColor(value) {
+        const raw = String(value || '').trim().toLowerCase();
+        if (/^#[0-9a-f]{6}$/.test(raw)) {
+          return raw;
+        }
+        if (/^#[0-9a-f]{3}$/.test(raw)) {
+          return '#' + raw[1] + raw[1] + raw[2] + raw[2] + raw[3] + raw[3];
+        }
+        return '#7b5034';
+      }
+
+      function escapeText(value) {
+        return String(value || '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function parseHeaderLinks(raw) {
+        return String(raw || '')
+          .split('\\n')
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .slice(0, 8)
+          .map((line) => {
+            const [label, url] = line.split('|').map((item) => item.trim());
+            if (!label || !url || !/^https?:\\/\\//i.test(url)) {
+              return null;
+            }
+            return { label: label.slice(0, 24), url: url.slice(0, 240) };
+          })
+          .filter(Boolean);
+      }
+
+      function renderHeaderLinksValue(links) {
+        return (links || [])
+          .map((item) => item.label + '|' + item.url)
+          .join('\\n');
+      }
+
+      function applySettingsToForm(config) {
+        const safe = config || {};
+        siteDisplayNameInput.value = safe.displayName || '';
+        siteDescriptionInput.value = safe.description || '';
+        siteHeroTitleInput.value = safe.heroTitle || '';
+        siteHeroSubtitleInput.value = safe.heroSubtitle || '';
+        siteAccentColorInput.value = normalizeHexColor(safe.accentColor || '#7b5034');
+        siteFooterNoteInput.value = safe.footerNote || '';
+        siteHeaderLinksInput.value = renderHeaderLinksValue(safe.headerLinks || []);
+      }
+
+      function draftKey(slug) {
+        const id = slug || 'new';
+        return 'stublogs-draft:' + location.host + ':' + id;
+      }
+
+      function saveDraft() {
+        const key = draftKey(state.currentSlug);
+        const payload = {
+          title: titleInput.value,
+          postSlug: postSlugInput.value,
+          description: descriptionInput.value,
+          content: contentInput.value,
+          published: publishedInput.checked,
+          savedAt: Date.now(),
+        };
+
+        try {
+          localStorage.setItem(key, JSON.stringify(payload));
+        } catch {
+          // ignore localStorage quota errors
+        }
+      }
+
+      function tryRestoreDraft(slug) {
+        const key = draftKey(slug);
+        try {
+          const raw = localStorage.getItem(key);
+          if (!raw) {
+            return;
+          }
+          const draft = JSON.parse(raw);
+          if (!draft || !draft.content) {
+            return;
+          }
+
+          if (!contentInput.value.trim()) {
+            titleInput.value = draft.title || titleInput.value;
+            postSlugInput.value = draft.postSlug || postSlugInput.value;
+            descriptionInput.value = draft.description || descriptionInput.value;
+            contentInput.value = draft.content || contentInput.value;
+            publishedInput.checked = Boolean(draft.published);
+            syncPreview();
+          }
+        } catch {
+          // ignore malformed drafts
+        }
+      }
+
       function syncPreview() {
         const slug = postSlugInput.value.trim().toLowerCase();
         previewLink.href = slug ? '/' + encodeURIComponent(slug) : '#';
@@ -1558,6 +2216,7 @@ function renderAdminPage(site, authed, baseDomain) {
         contentInput.value = '';
         syncPreview();
         setStatus('New post');
+        tryRestoreDraft('');
       }
 
       function renderPostList() {
@@ -1565,14 +2224,6 @@ function renderAdminPage(site, authed, baseDomain) {
           postList.innerHTML = '<li class="muted">No posts yet</li>';
           return;
         }
-
-        const escapeText = (value) =>
-          String(value || '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
 
         postList.innerHTML = state.posts
           .map((post) => {
@@ -1607,6 +2258,12 @@ function renderAdminPage(site, authed, baseDomain) {
         renderPostList();
       }
 
+      async function refreshSettings() {
+        const payload = await fetchJson('/api/site-settings');
+        state.siteConfig = payload.config || state.siteConfig;
+        applySettingsToForm(state.siteConfig);
+      }
+
       async function loadPost(slug) {
         if (!slug) {
           return;
@@ -1623,6 +2280,7 @@ function renderAdminPage(site, authed, baseDomain) {
           contentInput.value = post.content || '';
           syncPreview();
           renderPostList();
+          tryRestoreDraft(post.postSlug);
           setStatus('Loaded ' + post.postSlug);
         } catch (error) {
           setStatus(error.message || 'Failed to load post', true);
@@ -1663,13 +2321,41 @@ function renderAdminPage(site, authed, baseDomain) {
           syncPreview();
           await refreshPosts();
           setStatus('Saved at ' + new Date().toLocaleTimeString());
+          saveDraft();
         } catch (error) {
           setStatus(error.message || 'Save failed', true);
         }
       }
 
+      async function saveSiteSettings() {
+        setStatus('Saving site settings...');
+        try {
+          const payload = await fetchJson('/api/site-settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              displayName: siteDisplayNameInput.value.trim(),
+              description: siteDescriptionInput.value.trim(),
+              heroTitle: siteHeroTitleInput.value.trim(),
+              heroSubtitle: siteHeroSubtitleInput.value.trim(),
+              accentColor: normalizeHexColor(siteAccentColorInput.value),
+              footerNote: siteFooterNoteInput.value.trim(),
+              headerLinks: parseHeaderLinks(siteHeaderLinksInput.value),
+            }),
+          });
+
+          state.siteConfig = payload.config || state.siteConfig;
+          applySettingsToForm(state.siteConfig);
+          document.documentElement.style.setProperty('--accent', state.siteConfig.accentColor || '#7b5034');
+          setStatus('Site settings saved');
+        } catch (error) {
+          setStatus(error.message || 'Failed to save site settings', true);
+        }
+      }
+
       document.getElementById('new-post').addEventListener('click', resetEditor);
       document.getElementById('save').addEventListener('click', savePost);
+      document.getElementById('save-settings').addEventListener('click', saveSiteSettings);
       document.getElementById('logout').addEventListener('click', async () => {
         await fetch('/api/logout', { method: 'POST' });
         location.reload();
@@ -1687,14 +2373,27 @@ function renderAdminPage(site, authed, baseDomain) {
         syncPreview();
       });
 
+      contentInput.addEventListener('input', saveDraft);
+      titleInput.addEventListener('input', saveDraft);
+      descriptionInput.addEventListener('input', saveDraft);
+      publishedInput.addEventListener('change', saveDraft);
+
       document.addEventListener('keydown', (event) => {
         if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
           event.preventDefault();
-          savePost();
+          if (event.shiftKey) {
+            saveSiteSettings();
+          } else {
+            savePost();
+          }
         }
       });
 
+      applySettingsToForm(initialConfig);
       resetEditor();
+      refreshSettings().catch((error) => {
+        setStatus(error.message || 'Failed to load site settings', true);
+      });
       refreshPosts().catch((error) => {
         setStatus(error.message || 'Failed to load posts', true);
       });
@@ -1722,15 +2421,21 @@ function renderLayout(title, body) {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
     <title>${escapeHtml(title)}</title>
     <style>
       :root {
-        --bg-1: #f8f2e9;
-        --bg-2: #efe4d6;
-        --ink: #2f2b24;
-        --muted: #6b6357;
-        --panel: rgba(255, 252, 247, 0.88);
-        --line: rgba(55, 49, 40, 0.16);
+        --bg-1: #f6f0e8;
+        --bg-2: #eadfce;
+        --ink: #2b261f;
+        --muted: #666052;
+        --panel: rgba(255, 252, 247, 0.9);
+        --line: rgba(57, 47, 38, 0.2);
         --accent: #7b5034;
       }
 
@@ -1741,17 +2446,17 @@ function renderLayout(title, body) {
       body {
         margin: 0;
         color: var(--ink);
-        font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", serif;
+        font-family: "Chivo", "Trebuchet MS", sans-serif;
         background:
-          radial-gradient(900px 400px at 10% -10%, rgba(150, 106, 64, 0.14), transparent 60%),
-          radial-gradient(700px 350px at 100% 0%, rgba(99, 117, 132, 0.08), transparent 55%),
+          radial-gradient(900px 420px at 0% -10%, rgba(140, 99, 61, 0.16), transparent 60%),
+          radial-gradient(760px 380px at 100% 0%, rgba(96, 120, 137, 0.11), transparent 56%),
           linear-gradient(160deg, var(--bg-1), var(--bg-2));
         min-height: 100vh;
       }
 
       main {
         width: min(980px, 92vw);
-        margin: 2.8rem auto;
+        margin: 2.2rem auto;
       }
 
       .panel {
@@ -1768,7 +2473,7 @@ function renderLayout(title, body) {
       }
 
       .eyebrow {
-        font-family: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+        font-family: "JetBrains Mono", Menlo, Consolas, monospace;
         letter-spacing: 0.08em;
         text-transform: uppercase;
         color: var(--muted);
@@ -1795,7 +2500,7 @@ function renderLayout(title, body) {
       }
 
       label {
-        font-family: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+        font-family: "JetBrains Mono", Menlo, Consolas, monospace;
         font-size: 0.9rem;
       }
 
@@ -1818,6 +2523,10 @@ function renderLayout(title, body) {
         min-height: 360px;
         resize: vertical;
         line-height: 1.6;
+      }
+
+      .small-textarea {
+        min-height: 110px;
       }
 
       button,
@@ -1865,8 +2574,64 @@ function renderLayout(title, body) {
         font-size: 1.2rem;
       }
 
+      .site-nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+        margin: 0.6rem 0 1rem;
+      }
+
+      .site-nav a {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0.35rem 0.65rem;
+        text-decoration: none;
+        color: var(--ink);
+        font-size: 0.9rem;
+      }
+
+      .community-grid {
+        display: grid;
+        grid-template-columns: 1fr 320px;
+        gap: 1rem;
+      }
+
+      .community-panel {
+        border-left: 1px solid var(--line);
+        padding-left: 1rem;
+      }
+
+      .mini-list {
+        list-style: none;
+        padding: 0;
+        margin: 0 0 1rem;
+        display: grid;
+        gap: 0.4rem;
+      }
+
+      .mini-list li {
+        line-height: 1.45;
+      }
+
+      .site-footer {
+        margin-top: 1rem;
+        border-top: 1px dashed var(--line);
+        padding-top: 0.75rem;
+      }
+
       .article-body {
         line-height: 1.7;
+      }
+
+      .article-wrap {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 250px;
+        gap: 1rem;
+      }
+
+      .article-side {
+        border-left: 1px solid var(--line);
+        padding-left: 0.9rem;
       }
 
       .article-body pre {
@@ -1897,6 +2662,8 @@ function renderLayout(title, body) {
       .admin-list {
         border-right: 1px solid var(--line);
         padding-right: 0.9rem;
+        display: grid;
+        gap: 0.4rem;
       }
 
       .admin-list ul {
@@ -1943,7 +2710,7 @@ function renderLayout(title, body) {
       }
 
       code {
-        font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        font-family: "JetBrains Mono", Menlo, Consolas, monospace;
       }
 
       @media (max-width: 860px) {
@@ -1962,8 +2729,51 @@ function renderLayout(title, body) {
           padding-bottom: 0.9rem;
         }
 
+        .site-header {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .community-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .community-panel {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+          padding-left: 0;
+          padding-top: 0.9rem;
+        }
+
+        .article-wrap {
+          grid-template-columns: 1fr;
+        }
+
+        .article-side {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+          padding-left: 0;
+          padding-top: 0.8rem;
+        }
+
+        input,
+        textarea,
+        button,
+        .link-button {
+          font-size: 16px;
+        }
+
         textarea {
-          min-height: 280px;
+          min-height: 54vh;
+        }
+
+        .admin-editor .row-actions {
+          position: sticky;
+          bottom: 0;
+          background: rgba(255, 251, 244, 0.96);
+          padding: 0.45rem;
+          border: 1px solid var(--line);
+          border-radius: 10px;
         }
       }
     </style>
@@ -1983,6 +2793,13 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function toScriptJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026");
 }
 
 function formatDate(value) {

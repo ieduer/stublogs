@@ -9,6 +9,7 @@ routes = [
 
 [vars]
 BASE_DOMAIN = "bdfz.net"
+API_ENTRY_SLUG = "app"
 RESERVED_SLUGS = "750,admin,ai,api,api-mark,app,assets,blog,bwh2,cdn,chat,class,d,dashboard,dl,dmit,dmit160,dmit197,dmit2t,dmitpro2,dms,docs,ff,files,forum,ftp,gcjp,gcsg,gcus,gk,h,hlm,i,img,jc,jks,jks-ai,jpg,kama,kb,kw,kz,mail,mark,me,media,mf,moxie,mx,o,paper,ra112,ra154,rfc,seiue,ssh,static,status,stu,t,todo,tree,upvote,vpn,www,wx,xz"
 GITHUB_BRANCH = "main"
 CORS_ALLOWED_ORIGINS = "https://blog.bdfz.net"

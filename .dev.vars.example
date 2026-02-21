@@ -1,8 +1,11 @@
 BASE_DOMAIN=bdfz.net
+API_ENTRY_SLUG=app
 SESSION_SECRET=replace-with-long-random-string
 GITHUB_OWNER=replace-with-github-owner
 GITHUB_REPO=replace-with-github-repo
 GITHUB_BRANCH=main
 GITHUB_TOKEN=ghp_xxx
-INVITE_CODES=invite-2026
+INVITE_CODES=suen
 CORS_ALLOWED_ORIGINS=https://blog.bdfz.net
+TELEGRAM_BOT_TOKEN=telegram-bot-token
+TELEGRAM_CHAT_ID=5016203472
