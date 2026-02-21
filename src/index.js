@@ -191,6 +191,14 @@ async function handleRequest(request, env, ctx) {
     return fetch(request);
   }
 
+  if (hostSlug === apiEntrySlug && path === "/") {
+    return html(renderRootPage(baseDomain), 200);
+  }
+
+  if (hostSlug === apiEntrySlug && path === "/admin") {
+    return html(renderRootAdminHelp(baseDomain), 200);
+  }
+
   const site = await getSiteBySlug(env, hostSlug);
 
   if (!site) {
