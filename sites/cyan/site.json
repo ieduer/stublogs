@@ -1,16 +1,16 @@
 {
   "slug": "cyan",
   "displayName": "CyanTachyon",
-  "description": "喵喵喵喵喵",
-  "heroTitle": "CyanTachyon",
-  "heroSubtitle": "",
+  "description": "WOW",
+  "heroTitle": "大标题？",
+  "heroSubtitle": "副标题？",
   "colorTheme": "graphite",
-  "footerNote": "我也不知道应该写点啥",
+  "footerNote": "页尾文字？",
   "headerLinks": [],
-  "hideCommunitySites": true,
-  "hideCampusFeed": true,
+  "hideCommunitySites": false,
+  "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-21T15:12:40.717Z",
+  "updatedAt": "2026-02-21T15:15:44.293Z",
   "exportVersion": 2
 }
