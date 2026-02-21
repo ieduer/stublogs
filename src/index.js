@@ -2256,7 +2256,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
   );
 }
 
-function renderAdminPage(site, siteConfig, authed, baseDomain) {
+export function renderAdminPage(site, siteConfig, authed, baseDomain) {
   if (!authed) {
     return renderLayout(
       `${site.displayName} Admin`,
@@ -2315,7 +2315,7 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
   return renderLayout(
     `${site.displayName} Admin`,
-    `
+    String.raw`
     <section class="panel wide admin-shell">
       <header class="site-header">
         <div>
