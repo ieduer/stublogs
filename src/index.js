@@ -1333,9 +1333,11 @@ function normalizeSiteConfig(rawConfig, site) {
       description: "",
       heroTitle: "",
       heroSubtitle: "",
-      accentColor: "#7b5034",
+      colorTheme: "default",
       footerNote: "在這裡，把語文寫成你自己。",
       headerLinks: [],
+      hideCommunitySites: false,
+      hideCampusFeed: false,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       exportVersion: SITE_CONFIG_VERSION,
@@ -1352,9 +1354,11 @@ function normalizeSiteConfig(rawConfig, site) {
     description: sanitizeDescription(merged.description || ""),
     heroTitle: sanitizeTitle(merged.heroTitle || ""),
     heroSubtitle: sanitizeDescription(merged.heroSubtitle || ""),
-    accentColor: sanitizeHexColor(merged.accentColor || base.accentColor),
+    colorTheme: merged.colorTheme || base.colorTheme || "default",
     footerNote: sanitizeDescription(merged.footerNote || base.footerNote),
     headerLinks: sanitizeHeaderLinks(Array.isArray(merged.headerLinks) ? merged.headerLinks : []),
+    hideCommunitySites: Boolean(merged.hideCommunitySites),
+    hideCampusFeed: Boolean(merged.hideCampusFeed),
     createdAt: String(merged.createdAt || base.createdAt),
     updatedAt: String(merged.updatedAt || new Date().toISOString()),
     exportVersion: SITE_CONFIG_VERSION,
@@ -2049,14 +2053,13 @@ function renderRootAdminHelp(baseDomain) {
       <h1>請從你的子域名登入</h1>
       <p class="muted">管理地址格式：<code>https://xxx.${escapeHtml(baseDomain)}/admin</code></p>
     </section>
-  `
+  `, 'default'
   );
 }
 
 function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed, baseDomain) {
   const heading = siteConfig.heroTitle || site.displayName;
   const subtitle = siteConfig.heroSubtitle || site.description || "";
-  const accentStyle = `--accent:${escapeHtml(siteConfig.accentColor)};`;
 
   const navLinks = (siteConfig.headerLinks || []).length
     ? `<nav class="site-nav">${siteConfig.headerLinks
@@ -2083,7 +2086,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
       .join("\n")
     : `<p class="muted">還沒有已發佈文章。</p>`;
 
-  const peerSites = communitySites.length
+  const peerSites = (!siteConfig.hideCommunitySites && communitySites.length)
     ? communitySites
       .map(
         (peer) =>
@@ -2094,7 +2097,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
       .join("")
     : `<li class="muted">暫時沒有其他同學站點。</li>`;
 
-  const feedItems = campusFeed.length
+  const feedItems = (!siteConfig.hideCampusFeed && campusFeed.length)
     ? campusFeed
       .map(
         (entry) =>
@@ -2108,7 +2111,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
   return renderLayout(
     site.displayName,
     `
-    <section class="panel wide site-home-shell" style="${accentStyle}">
+    <section class="panel wide site-home-shell">
       <header class="site-header">
         <div>
           <p class="eyebrow">${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
@@ -2128,19 +2131,19 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
             ${list}
           </ul>
         </section>
+        ${(!siteConfig.hideCommunitySites || !siteConfig.hideCampusFeed) ? `
         <aside class="community-panel">
-          <h3>同學新站</h3>
-          <ul class="mini-list">${peerSites}</ul>
-          <h3>全校最新文章</h3>
-          <ul class="mini-list">${feedItems}</ul>
+          ${!siteConfig.hideCommunitySites ? `<h3>同學新站</h3><ul class="mini-list">${peerSites}</ul>` : ''}
+          ${!siteConfig.hideCampusFeed ? `<h3>全校最新文章</h3><ul class="mini-list">${feedItems}</ul>` : ''}
         </aside>
+        ` : ''}
       </div>
 
       <footer class="site-footer muted">${escapeHtml(
       siteConfig.footerNote || "在這裡，把語文寫成你自己。"
     )}</footer>
     </section>
-  `
+  `, siteConfig.colorTheme || 'default'
   );
 }
 
@@ -2164,7 +2167,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
     `${post.title} - ${site.displayName}`,
     `
     <div class="reading-progress" id="reading-progress"></div>
-    <section class="panel wide article-wrap" style="--accent:${escapeHtml(siteConfig.accentColor)};">
+    <section class="panel wide article-wrap">
       <article class="article">
         <p class="eyebrow"><a href="/">← ${escapeHtml(site.displayName)}</a> · ${escapeHtml(
       site.slug
@@ -2201,7 +2204,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
         }
       })();
     </script>
-  `
+  `, siteConfig.colorTheme || 'default'
   );
 }
 
@@ -2258,14 +2261,14 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
           }
         });
       </script>
-    `
+    `, siteConfig.colorTheme || 'default'
     );
   }
 
   return renderLayout(
     `${site.displayName} Admin`,
     `
-    <section class="panel wide admin-shell" style="--accent:${escapeHtml(siteConfig.accentColor)};">
+    <section class="panel wide admin-shell">
       <header class="site-header">
         <div>
           <p class="eyebrow">editor</p>
@@ -2314,8 +2317,7 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
             </div>
             <textarea id="content" placeholder="# Start writing..."></textarea>
             <div class="row-actions">
-              <button id="save" type="button">Save (⌘/Ctrl + S)</button>
-              <a id="preview" class="link-button" href="#" target="_blank" rel="noreferrer noopener">Open</a>
+              <button id="save" type="button">發佈 / 更新</button>
             </div>
             <p id="editor-status" class="muted"></p>
           </section>
@@ -2335,12 +2337,25 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
             <input id="siteHeroTitle" maxlength="120" />
             <label>首頁副標</label>
             <input id="siteHeroSubtitle" maxlength="240" />
-            <label>主色</label>
-            <input id="siteAccentColor" maxlength="7" placeholder="#7b5034" />
+            <label>主題色系</label>
+            <select id="siteColorTheme" style="font:inherit;border-radius:10px;border:1px solid var(--line);background:rgba(255,255,255,.65);padding:.65rem .78rem;color:var(--ink);font-family:var(--font-mono);font-size:.92rem;">
+              <option value="default">預設 / 棕色 (Brown)</option>
+              <option value="ocean">大海 / 湖藍 (Ocean)</option>
+              <option value="forest">森林 / 墨綠 (Forest)</option>
+              <option value="violet">紫羅蘭 / 淡紫 (Violet)</option>
+            </select>
             <label>頁尾文字</label>
             <input id="siteFooterNote" maxlength="240" />
             <label>外部連結（每行：標題|https://url）</label>
             <textarea id="siteHeaderLinks" class="small-textarea" placeholder="作品集|https://example.com"></textarea>
+            <label class="inline-check">
+              <input id="siteHideCommunitySites" type="checkbox" />
+              隱藏「同學新站」板塊
+            </label>
+            <label class="inline-check">
+              <input id="siteHideCampusFeed" type="checkbox" />
+              隱藏「全校最新文章」板塊
+            </label>
             <button id="save-settings" type="button">儲存站點設定</button>
           </section>
           <aside class="settings-aside">
@@ -2367,9 +2382,11 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const siteDescriptionInput = document.getElementById('siteDescription');
       const siteHeroTitleInput = document.getElementById('siteHeroTitle');
       const siteHeroSubtitleInput = document.getElementById('siteHeroSubtitle');
-      const siteAccentColorInput = document.getElementById('siteAccentColor');
+      const siteColorThemeInput = document.getElementById('siteColorTheme');
       const siteFooterNoteInput = document.getElementById('siteFooterNote');
       const siteHeaderLinksInput = document.getElementById('siteHeaderLinks');
+      const siteHideCommunitySitesInput = document.getElementById('siteHideCommunitySites');
+      const siteHideCampusFeedInput = document.getElementById('siteHideCampusFeed');
       const titleInput = document.getElementById('title');
       const postSlugInput = document.getElementById('postSlug');
       const descriptionInput = document.getElementById('description');
@@ -2442,9 +2459,11 @@ function applySettingsToForm(config) {
   siteDescriptionInput.value = safe.description || '';
   siteHeroTitleInput.value = safe.heroTitle || '';
   siteHeroSubtitleInput.value = safe.heroSubtitle || '';
-  siteAccentColorInput.value = normalizeHexColor(safe.accentColor || '#7b5034');
+  if (siteColorThemeInput) siteColorThemeInput.value = safe.colorTheme || 'default';
   siteFooterNoteInput.value = safe.footerNote || '';
   siteHeaderLinksInput.value = renderHeaderLinksValue(safe.headerLinks || []);
+  if (siteHideCommunitySitesInput) siteHideCommunitySitesInput.checked = !!safe.hideCommunitySites;
+  if (siteHideCampusFeedInput) siteHideCampusFeedInput.checked = !!safe.hideCampusFeed;
 }
 
 function draftKey(slug) {
@@ -2571,7 +2590,7 @@ async function loadPost(slug) {
     descriptionInput.value = post.description || '';
     publishedInput.checked = Number(post.published) === 1;
     contentInput.value = post.content || '';
-    syncPreview();
+    if (typeof updateSaveBtn === 'function') updateSaveBtn();
     renderPostList();
     tryRestoreDraft(post.postSlug);
     setStatus('Loaded ' + post.postSlug);
@@ -2611,7 +2630,6 @@ async function savePost() {
 
     state.currentSlug = payload.post.postSlug;
     postSlugInput.value = payload.post.postSlug;
-    syncPreview();
     await refreshPosts();
     setStatus('Saved at ' + new Date().toLocaleTimeString());
     saveDraft();
@@ -2631,15 +2649,17 @@ async function saveSiteSettings() {
         description: siteDescriptionInput.value.trim(),
         heroTitle: siteHeroTitleInput.value.trim(),
         heroSubtitle: siteHeroSubtitleInput.value.trim(),
-        accentColor: normalizeHexColor(siteAccentColorInput.value),
+        colorTheme: siteColorThemeInput.value,
         footerNote: siteFooterNoteInput.value.trim(),
         headerLinks: parseHeaderLinks(siteHeaderLinksInput.value),
+        hideCommunitySites: siteHideCommunitySitesInput.checked,
+        hideCampusFeed: siteHideCampusFeedInput.checked,
       }),
     });
 
     state.siteConfig = payload.config || state.siteConfig;
     applySettingsToForm(state.siteConfig);
-    document.documentElement.style.setProperty('--accent', state.siteConfig.accentColor || '#7b5034');
+    document.body.className = "theme-" + (state.siteConfig.colorTheme || "default");
     setStatus('Site settings saved');
   } catch (error) {
     setStatus(error.message || 'Failed to save site settings', true);
@@ -2657,19 +2677,26 @@ document.getElementById('logout').addEventListener('click', async () => {
 titleInput.addEventListener('blur', () => {
   if (!postSlugInput.value.trim()) {
     postSlugInput.value = toSlug(titleInput.value);
-    syncPreview();
   }
 });
 
 postSlugInput.addEventListener('input', () => {
   postSlugInput.value = toSlug(postSlugInput.value);
-  syncPreview();
 });
 
 contentInput.addEventListener('input', saveDraft);
 titleInput.addEventListener('input', saveDraft);
 descriptionInput.addEventListener('input', saveDraft);
-publishedInput.addEventListener('change', saveDraft);
+
+const saveBtn = document.getElementById('save');
+function updateSaveBtn() {
+  saveBtn.textContent = publishedInput.checked ? '發佈 / 更新 (⌘S)' : '儲存草稿 (⌘S)';
+}
+publishedInput.addEventListener('change', () => {
+  saveDraft();
+  updateSaveBtn();
+});
+updateSaveBtn();
 
 document.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
@@ -2822,7 +2849,7 @@ function renderSimpleMessage(code, message) {
   );
 }
 
-function renderLayout(title, body) {
+function renderLayout(title, body, colorTheme = 'default') {
   return `<!doctype html>
 <html lang="zh-Hant">
   <head>
@@ -2847,6 +2874,9 @@ function renderLayout(title, body) {
   --font-mono: 'Fira Code','JetBrains Mono',Menlo,Consolas,monospace;
   --font-sans: 'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
 }
+.theme-ocean{--accent:#005c99;--accent-glow:rgba(0,92,153,0.15)}
+.theme-forest{--accent:#2e6040;--accent-glow:rgba(46,96,64,0.15)}
+.theme-violet{--accent:#6f42c1;--accent-glow:rgba(111,66,193,0.15)}
 @media (prefers-color-scheme:dark) {
   :root {
     --bg-1: #0f1318;
@@ -2860,6 +2890,9 @@ function renderLayout(title, body) {
     --accent-glow: rgba(92,160,208,0.12);
     --code-bg: rgba(255,255,255,0.06);
   }
+  .theme-ocean{--accent:#4da6ff;--accent-glow:rgba(77,166,255,0.15)}
+  .theme-forest{--accent:#5eb082;--accent-glow:rgba(94,176,130,0.15)}
+  .theme-violet{--accent:#a580e6;--accent-glow:rgba(165,128,230,0.15)}
 }
 *{box-sizing:border-box;margin:0;padding:0}
 ::selection{background:var(--accent-glow)}
@@ -2974,7 +3007,7 @@ code{font-family:var(--font-mono)}
 }
     </style>
   </head>
-  <body>
+  <body class="theme-${escapeHtml(colorTheme)}">
     <main>
       ${body}
     </main>
