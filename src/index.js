@@ -24,6 +24,7 @@ const SESSION_COOKIE = "stublogs_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const DEFAULT_API_ENTRY_SLUG = "app";
 const SITE_CONFIG_VERSION = 2;
+const LEGACY_FOOTER_NOTE = "在這裡，把語文寫成你自己。";
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
@@ -1328,7 +1329,14 @@ function sanitizeColorTheme(value) {
   const theme = String(value || "")
     .trim()
     .toLowerCase();
-  if (theme === "ocean" || theme === "forest" || theme === "violet") {
+  if (
+    theme === "ocean" ||
+    theme === "forest" ||
+    theme === "violet" ||
+    theme === "sunset" ||
+    theme === "mint" ||
+    theme === "graphite"
+  ) {
     return theme;
   }
   return "default";
@@ -1384,6 +1392,7 @@ function normalizeSiteConfig(rawConfig, site) {
     ...base,
     ...(rawConfig && typeof rawConfig === "object" ? rawConfig : {}),
   };
+  const normalizedFooterNote = sanitizeDescription(merged.footerNote || base.footerNote);
 
   return {
     slug: String(merged.slug || base.slug).toLowerCase(),
@@ -1392,7 +1401,7 @@ function normalizeSiteConfig(rawConfig, site) {
     heroTitle: sanitizeTitle(merged.heroTitle || ""),
     heroSubtitle: sanitizeDescription(merged.heroSubtitle || ""),
     colorTheme: sanitizeColorTheme(merged.colorTheme || base.colorTheme || "default"),
-    footerNote: sanitizeDescription(merged.footerNote || base.footerNote),
+    footerNote: normalizedFooterNote === LEGACY_FOOTER_NOTE ? "" : normalizedFooterNote,
     headerLinks: sanitizeHeaderLinks(Array.isArray(merged.headerLinks) ? merged.headerLinks : []),
     hideCommunitySites: Boolean(merged.hideCommunitySites),
     hideCampusFeed: Boolean(merged.hideCampusFeed),
@@ -2123,7 +2132,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
         `
       )
       .join("\n")
-    : `<p class="muted">還沒有已發佈文章。</p>`;
+    : `<li class="post-item muted">還沒有已發佈文章。</li>`;
 
   const peerSites = (!siteConfig.hideCommunitySites && communitySites.length)
     ? communitySites
@@ -2178,7 +2187,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
         ` : ''}
       </div>
 
-      ${(siteConfig.footerNote && siteConfig.footerNote !== "在這裡，把語文寫成你自己。")
+      ${(siteConfig.footerNote)
       ? `<footer class="site-footer muted">${escapeHtml(siteConfig.footerNote)}</footer>`
       : ''}
     </section>
@@ -2352,6 +2361,9 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
               <button type="button" data-md="heading" title="Heading">H</button>
               <button type="button" data-md="link" title="Link">🔗</button>
               <button type="button" data-md="list" title="List">•</button>
+              <button type="button" data-md="ordered" title="Ordered list">1.</button>
+              <button type="button" data-md="quote" title="Quote">❝</button>
+              <button type="button" data-md="hr" title="Divider">—</button>
               <button type="button" id="fullscreen-toggle" class="fullscreen-btn">⛶ 全屏</button>
             </div>
             <textarea id="content" placeholder="# Start writing..."></textarea>
@@ -2383,6 +2395,9 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
               <option value="ocean">大海 / 湖藍 (Ocean)</option>
               <option value="forest">森林 / 墨綠 (Forest)</option>
               <option value="violet">紫羅蘭 / 淡紫 (Violet)</option>
+              <option value="sunset">晚霞 / 赭紅 (Sunset)</option>
+              <option value="mint">薄荷 / 青綠 (Mint)</option>
+              <option value="graphite">石墨 / 藍灰 (Graphite)</option>
             </select>
             <label>頁尾文字</label>
             <input id="siteFooterNote" maxlength="240" />
@@ -2397,6 +2412,7 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
               隱藏「全校最新文章」板塊
             </label>
             <button id="save-settings" type="button">儲存站點設定</button>
+            <p id="settings-status" class="muted"></p>
           </section>
           <aside class="settings-aside">
             <h3>匯入</h3>
@@ -2433,11 +2449,20 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const publishedInput = document.getElementById('published');
       const contentInput = document.getElementById('content');
       const statusEl = document.getElementById('editor-status');
+      const settingsStatusEl = document.getElementById('settings-status');
       const previewLink = document.getElementById('preview');
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
-      statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+        statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+      }
+
+      function setSettingsStatus(message, isError = false) {
+        if (!settingsStatusEl) {
+          return;
+        }
+        settingsStatusEl.textContent = message;
+        settingsStatusEl.style.color = isError ? '#ae3a22' : '#6b6357';
       }
 
       function toSlug(value) {
@@ -2607,6 +2632,9 @@ async function fetchJson(path, options) {
     payload = null;
   }
   if (!response.ok) {
+    if (response.status === 401) {
+      throw new Error('登入已過期，請重新登入');
+    }
     throw new Error((payload && payload.error) || ('Request failed (' + response.status + ')'));
   }
   if (!payload || typeof payload !== 'object') {
@@ -2665,6 +2693,10 @@ async function savePost() {
   }
 
   setStatus('Saving...');
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = '儲存中...';
+  }
 
   try {
     const payload = await fetchJson('/api/posts', {
@@ -2691,11 +2723,20 @@ async function savePost() {
     saveDraft();
   } catch (error) {
     setStatus(error.message || 'Save failed', true);
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+    }
+    updateSaveBtn();
   }
 }
 
 async function saveSiteSettings() {
-  setStatus('Saving site settings...');
+  setSettingsStatus('儲存設定中...');
+  if (saveSettingsBtn) {
+    saveSettingsBtn.disabled = true;
+    saveSettingsBtn.textContent = '儲存中...';
+  }
   try {
     const payload = await fetchJson('/api/site-settings', {
       method: 'POST',
@@ -2716,9 +2757,14 @@ async function saveSiteSettings() {
     state.siteConfig = payload.config || state.siteConfig;
     applySettingsToForm(state.siteConfig);
     document.body.className = "theme-" + (state.siteConfig.colorTheme || "default");
-    setStatus('Site settings saved');
+    setSettingsStatus('站點設定已儲存');
   } catch (error) {
-    setStatus(error.message || 'Failed to save site settings', true);
+    setSettingsStatus(error.message || '儲存站點設定失敗', true);
+  } finally {
+    if (saveSettingsBtn) {
+      saveSettingsBtn.disabled = false;
+      saveSettingsBtn.textContent = '儲存站點設定';
+    }
   }
 }
 
@@ -2747,7 +2793,11 @@ titleInput.addEventListener('input', saveDraft);
 descriptionInput.addEventListener('input', saveDraft);
 
 const saveBtn = document.getElementById('save');
+const saveSettingsBtn = document.getElementById('save-settings');
 function updateSaveBtn() {
+  if (!saveBtn) {
+    return;
+  }
   saveBtn.textContent = publishedInput.checked ? '發佈 / 更新 (⌘S)' : '儲存草稿 (⌘S)';
 }
 publishedInput.addEventListener('change', () => {
@@ -2770,7 +2820,7 @@ document.addEventListener('keydown', (event) => {
 applySettingsToForm(initialConfig);
 resetEditor();
 refreshSettings().catch((error) => {
-  setStatus(error.message || 'Failed to load site settings', true);
+  setSettingsStatus(error.message || 'Failed to load site settings', true);
 });
 refreshPosts().catch((error) => {
   setStatus(error.message || 'Failed to load posts', true);
@@ -2803,6 +2853,7 @@ function insertMd(type) {
   const end = ta.selectionEnd;
   const sel = ta.value.substring(start, end);
   let before = '', after = '';
+  let replacement = '';
   switch (type) {
     case 'bold': before = '**'; after = '**'; break;
     case 'italic': before = '*'; after = '*'; break;
@@ -2810,8 +2861,23 @@ function insertMd(type) {
     case 'heading': before = '## '; break;
     case 'link': before = '['; after = '](https://)'; break;
     case 'list': before = '- '; break;
+    case 'ordered': before = '1. '; break;
+    case 'quote': before = '> '; break;
+    case 'hr': replacement = '\n---\n'; break;
   }
-  const replacement = before + (sel || type) + after;
+  if (!replacement) {
+    const placeholders = {
+      bold: '文字',
+      italic: '文字',
+      code: 'code',
+      heading: '標題',
+      link: '連結文字',
+      list: '列表項',
+      ordered: '列表項',
+      quote: '引用文字',
+    };
+    replacement = before + (sel || placeholders[type] || '') + after;
+  }
   ta.setRangeText(replacement, start, end, 'end');
   ta.focus();
   saveDraft();
@@ -2935,6 +3001,9 @@ function renderLayout(title, body, colorTheme = 'default') {
 .theme-ocean{--accent:#005c99;--accent-glow:rgba(0,92,153,0.15)}
 .theme-forest{--accent:#2e6040;--accent-glow:rgba(46,96,64,0.15)}
 .theme-violet{--accent:#6f42c1;--accent-glow:rgba(111,66,193,0.15)}
+.theme-sunset{--accent:#b9512e;--accent-glow:rgba(185,81,46,0.15)}
+.theme-mint{--accent:#1f8673;--accent-glow:rgba(31,134,115,0.15)}
+.theme-graphite{--accent:#475d82;--accent-glow:rgba(71,93,130,0.16)}
 @media (prefers-color-scheme:dark) {
   :root {
     --bg-1: #0f1318;
@@ -2951,6 +3020,9 @@ function renderLayout(title, body, colorTheme = 'default') {
   .theme-ocean{--accent:#4da6ff;--accent-glow:rgba(77,166,255,0.15)}
   .theme-forest{--accent:#5eb082;--accent-glow:rgba(94,176,130,0.15)}
   .theme-violet{--accent:#a580e6;--accent-glow:rgba(165,128,230,0.15)}
+  .theme-sunset{--accent:#ef8a63;--accent-glow:rgba(239,138,99,0.18)}
+  .theme-mint{--accent:#73cfbb;--accent-glow:rgba(115,207,187,0.18)}
+  .theme-graphite{--accent:#8ea3c8;--accent-glow:rgba(142,163,200,0.2)}
 }
 *{box-sizing:border-box;margin:0;padding:0}
 ::selection{background:var(--accent-glow)}
@@ -2996,8 +3068,10 @@ button:active,.link-button:active{transform:translateY(0)}
 .article-body{line-height:1.78;font-size:1.05rem}
 .article-body h2,.article-body h3,.article-body h4{margin-top:1.6rem}
 .article-body p{margin:.8rem 0}
+.article-body hr{border:none;border-top:1px dashed var(--line);margin:1.2rem 0}
 .article-body blockquote{border-left:3px solid var(--accent);padding:.5rem 0 .5rem 1rem;margin:1rem 0;color:var(--muted);background:var(--accent-glow);border-radius:0 8px 8px 0}
 .article-body ul,.article-body ol{padding-left:1.4rem;margin:.6rem 0}
+.article-body del{opacity:.75}
 .article-body img{max-width:100%;border-radius:8px;margin:.8rem 0}
 .article-wrap{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:1.2rem}
 .article-side{border-left:1px solid var(--line);padding-left:.9rem}
@@ -3108,12 +3182,13 @@ function buildWelcomePost(slug, displayName, baseDomain) {
   return `# Welcome to ${displayName} \n\n你已成功建立站點：\`${slug}.${baseDomain}\`。\n\n- 前台首頁：https://${slug}.${baseDomain}\n- 後台編輯：https://${slug}.${baseDomain}/admin\n\n現在你可以直接在後台開始寫作，體驗會偏向 Bear 的簡潔流。\n`;
 }
 
-function renderMarkdown(source) {
+export function renderMarkdown(source) {
   const lines = String(source || "").replace(/\r\n/g, "\n").split("\n");
 
   const blocks = [];
   let paragraph = [];
-  let listItems = [];
+  let bulletItems = [];
+  let orderedItems = [];
   let codeBlock = null;
 
   const flushParagraph = () => {
@@ -3125,12 +3200,20 @@ function renderMarkdown(source) {
     paragraph = [];
   };
 
-  const flushList = () => {
-    if (!listItems.length) {
+  const flushBulletList = () => {
+    if (!bulletItems.length) {
       return;
     }
-    blocks.push(`<ul>${listItems.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul>`);
-    listItems = [];
+    blocks.push(`<ul>${bulletItems.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul>`);
+    bulletItems = [];
+  };
+
+  const flushOrderedList = () => {
+    if (!orderedItems.length) {
+      return;
+    }
+    blocks.push(`<ol>${orderedItems.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ol>`);
+    orderedItems = [];
   };
 
   const flushCode = () => {
@@ -3144,7 +3227,8 @@ function renderMarkdown(source) {
   for (const line of lines) {
     if (line.trim().startsWith("```")) {
       flushParagraph();
-      flushList();
+      flushBulletList();
+      flushOrderedList();
 
       if (codeBlock) {
         flushCode();
@@ -3162,14 +3246,16 @@ function renderMarkdown(source) {
 
     if (!line.trim()) {
       flushParagraph();
-      flushList();
+      flushBulletList();
+      flushOrderedList();
       continue;
     }
 
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       flushParagraph();
-      flushList();
+      flushBulletList();
+      flushOrderedList();
       const level = heading[1].length;
       blocks.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
       continue;
@@ -3178,14 +3264,32 @@ function renderMarkdown(source) {
     const listItem = line.match(/^\s*[-*]\s+(.+)$/);
     if (listItem) {
       flushParagraph();
-      listItems.push(listItem[1]);
+      flushOrderedList();
+      bulletItems.push(listItem[1]);
+      continue;
+    }
+
+    const orderedItem = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (orderedItem) {
+      flushParagraph();
+      flushBulletList();
+      orderedItems.push(orderedItem[1]);
+      continue;
+    }
+
+    if (/^\s*---\s*$/.test(line)) {
+      flushParagraph();
+      flushBulletList();
+      flushOrderedList();
+      blocks.push("<hr />");
       continue;
     }
 
     const quote = line.match(/^>\s?(.*)$/);
     if (quote) {
       flushParagraph();
-      flushList();
+      flushBulletList();
+      flushOrderedList();
       blocks.push(`<blockquote>${renderInline(quote[1])}</blockquote>`);
       continue;
     }
@@ -3194,7 +3298,8 @@ function renderMarkdown(source) {
   }
 
   flushParagraph();
-  flushList();
+  flushBulletList();
+  flushOrderedList();
   flushCode();
 
   return blocks.join("\n");
@@ -3204,6 +3309,7 @@ function renderInline(value) {
   let text = escapeHtml(value);
 
   text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
+  text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
   text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   text = text.replace(/\*([^*]+)\*/g, "<em>$1</em>");
 
