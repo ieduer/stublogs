@@ -2279,11 +2279,54 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
         </div>
       </header>
 
-      <div class="admin-grid">
-        <aside class="admin-list">
-          <button id="settings-toggle" class="settings-toggle" type="button">▸ Site Settings</button>
-          <div id="settings-section" class="settings-section">
-            <p class="muted">Site Settings</p>
+      <nav class="admin-tabs">
+        <button id="tab-posts" class="admin-tab active" type="button">✏️ Posts</button>
+        <button id="tab-settings" class="admin-tab" type="button">⚙️ Settings</button>
+      </nav>
+
+      <!-- ═══ POSTS TAB ═══ -->
+      <div id="panel-posts" class="admin-panel">
+        <div class="admin-grid">
+          <aside class="admin-list">
+            <p class="muted">My Posts</p>
+            <ul id="post-list"></ul>
+          </aside>
+          <section class="admin-editor">
+            <label>Title</label>
+            <input id="title" maxlength="120" />
+            <label>Post slug</label>
+            <input id="postSlug" maxlength="80" />
+            <label>Description</label>
+            <input id="description" maxlength="240" />
+            <label class="inline-check">
+              <input id="published" type="checkbox" />
+              Published
+            </label>
+            <label>Content</label>
+            <div class="md-toolbar">
+              <button type="button" data-md="bold" title="Bold">B</button>
+              <button type="button" data-md="italic" title="Italic">I</button>
+              <button type="button" data-md="code" title="Code">&#96;</button>
+              <button type="button" data-md="heading" title="Heading">H</button>
+              <button type="button" data-md="link" title="Link">🔗</button>
+              <button type="button" data-md="list" title="List">•</button>
+              <button type="button" id="fullscreen-toggle" class="fullscreen-btn">⛶ 全屏</button>
+            </div>
+            <textarea id="content" placeholder="# Start writing..."></textarea>
+            <div class="row-actions">
+              <button id="save" type="button">Save (⌘/Ctrl + S)</button>
+              <a id="preview" class="link-button" href="#" target="_blank" rel="noreferrer noopener">Open</a>
+            </div>
+            <p id="editor-status" class="muted"></p>
+          </section>
+        </div>
+      </div>
+
+      <!-- ═══ SETTINGS TAB ═══ -->
+      <div id="panel-settings" class="admin-panel" style="display:none">
+        <div class="settings-grid">
+          <section class="settings-form">
+            <h2>站點設定</h2>
             <label>顯示名稱</label>
             <input id="siteDisplayName" maxlength="60" />
             <label>站點簡介</label>
@@ -2299,54 +2342,17 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
             <label>外部連結（每行：標題|https://url）</label>
             <textarea id="siteHeaderLinks" class="small-textarea" placeholder="作品集|https://example.com"></textarea>
             <button id="save-settings" type="button">儲存站點設定</button>
-          </div>
-
-          <p class="muted">Posts</p>
-          <ul id="post-list"></ul>
-
-          <p class="muted" style="margin-top:0.8rem">Import</p>
-          <label>從 BearBlog 匯入 CSV</label>
-          <input id="import-file" type="file" accept=".csv" />
-          <button id="import-btn" type="button">匯入</button>
-          <p id="import-status" class="muted"></p>
-        </aside>
-
-        <section class="admin-editor">
-          <label>Title</label>
-          <input id="title" maxlength="120" />
-
-          <label>Post slug</label>
-          <input id="postSlug" maxlength="80" />
-
-          <label>Description</label>
-          <input id="description" maxlength="240" />
-
-          <label class="inline-check">
-            <input id="published" type="checkbox" />
-            Published
-          </label>
-
-          <label>Content</label>
-          <div class="md-toolbar">
-            <button type="button" data-md="bold" title="Bold">B</button>
-            <button type="button" data-md="italic" title="Italic">I</button>
-            <button type="button" data-md="code" title="Code">&#96;</button>
-            <button type="button" data-md="heading" title="Heading">H</button>
-            <button type="button" data-md="link" title="Link">🔗</button>
-            <button type="button" data-md="list" title="List">•</button>
-            <button type="button" id="fullscreen-toggle" class="fullscreen-btn">⛶ 全屏</button>
-          </div >
-          <textarea id="content" placeholder="# Start writing..."></textarea>
-
-          <div class="row-actions">
-            <button id="save" type="button">Save (⌘/Ctrl + S)</button>
-            <a id="preview" class="link-button" href="#" target="_blank" rel="noreferrer noopener">Open</a>
-          </div>
-
-          <p id="editor-status" class="muted"></p>
-        </section >
-      </div >
-    </section >
+          </section>
+          <aside class="settings-aside">
+            <h3>匯入</h3>
+            <p class="muted">從 BearBlog 匯入 CSV</p>
+            <input id="import-file" type="file" accept=".csv" />
+            <button id="import-btn" type="button">匯入</button>
+            <p id="import-status" class="muted"></p>
+          </aside>
+        </div>
+      </div>
+    </section>
 
     <script>
       const initialConfig = ${toScriptJson(siteConfig)};
@@ -2685,16 +2691,23 @@ refreshPosts().catch((error) => {
   setStatus(error.message || 'Failed to load posts', true);
 });
 
-// ── Settings toggle (mobile) ──
-const settingsToggle = document.getElementById('settings-toggle');
-const settingsSection = document.getElementById('settings-section');
-if (settingsToggle && settingsSection) {
-  if (window.innerWidth <= 860) {
-    settingsSection.classList.add('collapsed');
-  }
-  settingsToggle.addEventListener('click', () => {
-    const collapsed = settingsSection.classList.toggle('collapsed');
-    settingsToggle.textContent = (collapsed ? '▸' : '▾') + ' Site Settings';
+// ── Tab switching ──
+const tabPosts = document.getElementById('tab-posts');
+const tabSettings = document.getElementById('tab-settings');
+const panelPosts = document.getElementById('panel-posts');
+const panelSettings = document.getElementById('panel-settings');
+if (tabPosts && tabSettings) {
+  tabPosts.addEventListener('click', () => {
+    tabPosts.classList.add('active');
+    tabSettings.classList.remove('active');
+    panelPosts.style.display = '';
+    panelSettings.style.display = 'none';
+  });
+  tabSettings.addEventListener('click', () => {
+    tabSettings.classList.add('active');
+    tabPosts.classList.remove('active');
+    panelSettings.style.display = '';
+    panelPosts.style.display = 'none';
   });
 }
 
@@ -2907,11 +2920,17 @@ button:active,.link-button:active{transform:translateY(0)}
 .back-top.visible{opacity:1;transform:translateY(0)}
 /* admin */
 .admin-shell{display:grid;gap:1rem}
-.admin-grid{display:grid;grid-template-columns:280px minmax(0,1fr);gap:1.5rem}
+.admin-tabs{display:flex;gap:.4rem;border-bottom:2px solid var(--line);padding-bottom:0}
+.admin-tab{background:transparent;color:var(--muted);border:none;border-bottom:2px solid transparent;border-radius:0;padding:.6rem 1.2rem;font-family:var(--font-mono);font-size:.85rem;margin-bottom:-2px;transition:all .2s}
+.admin-tab:hover{color:var(--ink);transform:none}
+.admin-tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+.admin-panel{margin-top:1rem}
+.admin-grid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:1.5rem}
 .admin-list{border-right:1px solid var(--line);padding-right:1rem;display:grid;gap:.5rem;align-content:start}
 .admin-list ul{list-style:none;margin:0;padding:0;display:grid;gap:.4rem}
-.settings-toggle{display:none;width:100%;background:transparent;color:var(--muted);border:1px dashed var(--line);font-family:var(--font-mono);font-size:.82rem}
-.settings-section{display:grid;gap:.5rem}
+.settings-grid{display:grid;grid-template-columns:1fr 280px;gap:2rem}
+.settings-form{display:grid;gap:.5rem;align-content:start}
+.settings-aside{border-left:1px solid var(--line);padding-left:1.5rem;display:grid;gap:.5rem;align-content:start}
 .post-item-btn{width:100%;text-align:left;background:rgba(255,255,255,.55);color:var(--ink);border:1px solid var(--line);font-size:.88rem;transition:all .15s}
 @media(prefers-color-scheme:dark){.post-item-btn{background:rgba(255,255,255,.04)}}
 .post-item-btn:hover{border-color:var(--accent)}
@@ -2937,8 +2956,8 @@ code{font-family:var(--font-mono)}
   main{margin-top:1rem;width:95vw}
   .admin-grid{grid-template-columns:1fr}
   .admin-list{border-right:0;border-bottom:1px solid var(--line);padding-right:0;padding-bottom:.9rem}
-  .settings-toggle{display:flex}
-  .settings-section.collapsed{display:none}
+  .settings-grid{grid-template-columns:1fr}
+  .settings-aside{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:1rem}
   .site-header{flex-direction:column;align-items:stretch}
   .community-grid{grid-template-columns:1fr}
   .community-panel{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:.9rem}
