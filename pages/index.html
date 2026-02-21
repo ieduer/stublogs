@@ -3,17 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>blog.bdfz.net | Stublogs</title>
+    <title>Stublogs | bdfz.net 學生博客</title>
     <meta
       name="description"
       content="註冊後即可建立你的 xxx.bdfz.net 個人部落格，支援極簡編輯、同學互見與全站探索。"
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap"
-      rel="stylesheet"
-    />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -22,17 +18,17 @@
 
     <main class="panel">
       <header class="hero">
-        <p class="tag">BDFZ BLOG PORTAL</p>
+        <p class="tag">$ stublogs <span class="cursor-blink"></span></p>
         <h1>所謂語文，無非你寫。</h1>
         <p class="intro">
-          註冊後即可啟用 <code>xxx.bdfz.net</code>，直接進入編輯器發布文章。
-          平台提供同學站點列表與全站最新內容互見。
+          註冊後啟用 <code>xxx.bdfz.net</code>，進入編輯器發布文章。
+          同學站點互見，全校內容探索。
         </p>
       </header>
 
       <section class="grid">
         <article class="card register-card">
-          <h2>立即註冊</h2>
+          <h2>// 立即註冊</h2>
           <form id="register-form" class="form" autocomplete="off">
             <label for="slug">子域名（slug）</label>
             <input id="slug" name="slug" placeholder="alice" minlength="2" maxlength="30" required />
@@ -42,14 +38,15 @@
 
             <label for="adminPassword">管理密碼</label>
             <input id="adminPassword" name="adminPassword" type="password" minlength="8" required />
+            <div id="pwd-strength" class="pwd-strength"></div>
 
-            <label for="inviteCode">註冊邀請碼</label>
-            <input id="inviteCode" name="inviteCode" placeholder="請輸入邀請碼" required />
+            <label for="inviteCode">邀請碼</label>
+            <input id="inviteCode" name="inviteCode" placeholder="輸入邀請碼" required />
 
             <label for="description">站點簡介（可選）</label>
-            <input id="description" name="description" maxlength="240" placeholder="這裡寫你的簡介" />
+            <input id="description" name="description" maxlength="240" placeholder="一句話介紹你自己" />
 
-            <button type="submit">建立我的 Blog</button>
+            <button type="submit">→ 建立我的 Blog</button>
           </form>
 
           <p id="status" class="status" aria-live="polite"></p>
@@ -57,8 +54,8 @@
 
         <article class="card discover-card">
           <div class="stats">
-            <h2>全站站點</h2>
-            <p class="mono"><span id="site-count">0</span> 個</p>
+            <h2>// 全站</h2>
+            <p class="mono"><span id="site-count">0</span></p>
           </div>
 
           <h3>最新加入</h3>
@@ -71,21 +68,25 @@
 
       <section class="card full-list-card">
         <div class="list-header">
-          <h2>全部用戶站點</h2>
-          <input id="site-filter" placeholder="搜尋 slug 或名稱" />
+          <h2>// 全部站點</h2>
+          <input id="site-filter" placeholder="搜尋 slug 或名稱…" />
         </div>
         <ul id="all-sites" class="site-list"></ul>
       </section>
 
-      <section class="card guide-card">
+      <section class="card guide-card" tabindex="0">
         <h2>使用說明</h2>
-        <ol>
-          <li>在本頁填寫邀請碼並註冊，選擇專屬子域名。</li>
-          <li>建立成功後自動跳轉至 <code>/admin</code>，即可開始寫作。</li>
-          <li>文章發布後網址格式為 <code>https://xxx.bdfz.net/文章-slug</code>。</li>
-          <li>後台可編輯站點樣式與連結，也能一鍵匯出資料。</li>
-        </ol>
+        <div class="guide-steps">
+          <ol>
+            <li>填寫邀請碼並註冊，選擇專屬子域名。</li>
+            <li>建立成功後自動跳轉至 <code>/admin</code>，開始寫作。</li>
+            <li>文章網址格式：<code>https://xxx.bdfz.net/文章-slug</code></li>
+            <li>後台可編輯樣式、管理連結，也能一鍵匯出資料。</li>
+          </ol>
+        </div>
       </section>
+
+      <p class="tagline">所謂語文，無非 <span>你</span> 寫下。</p>
     </main>
 
     <script src="/app.js" defer></script>

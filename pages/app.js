@@ -1,11 +1,12 @@
 const API_ORIGIN = "https://app.bdfz.net";
-
 const POLL_MS = 15000;
 
 const form = document.getElementById("register-form");
 const statusEl = document.getElementById("status");
 const slugInput = document.getElementById("slug");
 const nameInput = document.getElementById("displayName");
+const pwdInput = document.getElementById("adminPassword");
+const pwdStrength = document.getElementById("pwd-strength");
 const siteCountEl = document.getElementById("site-count");
 const latestSitesEl = document.getElementById("latest-sites");
 const allSitesEl = document.getElementById("all-sites");
@@ -16,9 +17,11 @@ let timer = null;
 let pollTimer = null;
 let allSites = [];
 
+/* ── Helpers ── */
+
 function setStatus(message, isError = false) {
   statusEl.textContent = message;
-  statusEl.style.color = isError ? "#ab3720" : "#655e52";
+  statusEl.className = "status " + (isError ? "err" : message ? "ok" : "");
 }
 
 function normalizeSlug(value) {
@@ -35,16 +38,13 @@ function escapeText(value) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
+    .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
 
 function formatDate(value) {
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return "";
-  }
-
+  if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleString("zh-Hant", {
     month: "2-digit",
     day: "2-digit",
@@ -56,46 +56,68 @@ function formatDate(value) {
 async function fetchJson(path, options) {
   const response = await fetch(`${API_ORIGIN}${path}`, options);
   const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "Request failed");
-  }
+  if (!response.ok) throw new Error(payload.error || "Request failed");
   return payload;
 }
+
+/* ── Password strength ── */
+
+function checkPwdStrength(pwd) {
+  if (!pwd) { pwdStrength.textContent = ""; return; }
+  let score = 0;
+  if (pwd.length >= 8) score++;
+  if (pwd.length >= 12) score++;
+  if (/[a-z]/.test(pwd) && /[A-Z]/.test(pwd)) score++;
+  if (/\d/.test(pwd)) score++;
+  if (/[^a-zA-Z0-9]/.test(pwd)) score++;
+
+  const labels = ["", "弱", "弱", "中等", "強", "很強"];
+  const colors = ["", "#ff5555", "#ff5555", "#f1fa8c", "#00ff9f", "#00ff9f"];
+  pwdStrength.textContent = labels[score] || "";
+  pwdStrength.style.color = colors[score] || "";
+  pwdStrength.style.textShadow = score >= 4 ? "0 0 8px rgba(0,255,159,0.4)" : "none";
+}
+
+if (pwdInput) {
+  pwdInput.addEventListener("input", () => checkPwdStrength(pwdInput.value));
+}
+
+/* ── Render ── */
 
 function renderSites(sites) {
   const keyword = String(siteFilterInput.value || "").trim().toLowerCase();
   const filtered = keyword
     ? sites.filter((site) => {
-        const hay = `${site.slug} ${site.displayName} ${site.description}`.toLowerCase();
-        return hay.includes(keyword);
-      })
+      const hay = `${site.slug} ${site.displayName} ${site.description}`.toLowerCase();
+      return hay.includes(keyword);
+    })
     : sites;
 
   allSitesEl.innerHTML = filtered.length
     ? filtered
-        .map(
-          (site) =>
-            `<li><a href="${escapeText(site.url)}" target="_blank" rel="noreferrer noopener">${escapeText(
-              site.displayName
-            )}</a><div class="meta">${escapeText(site.slug)}.bdfz.net · ${escapeText(
-              site.description || ""
-            )}</div></li>`
-        )
-        .join("")
+      .map(
+        (site) =>
+          `<li><a href="${escapeText(site.url)}" target="_blank" rel="noreferrer noopener">${escapeText(
+            site.displayName
+          )}</a><div class="meta">${escapeText(site.slug)}.bdfz.net · ${escapeText(
+            site.description || ""
+          )}</div></li>`
+      )
+      .join("")
     : `<li class="meta">沒有符合條件的站點</li>`;
 
   latestSitesEl.innerHTML = sites.length
     ? sites
-        .slice(0, 8)
-        .map(
-          (site) =>
-            `<li><a href="${escapeText(site.url)}" target="_blank" rel="noreferrer noopener">${escapeText(
-              site.displayName
-            )}</a><div class="meta">${escapeText(site.slug)}.bdfz.net · ${formatDate(
-              site.createdAt
-            )}</div></li>`
-        )
-        .join("")
+      .slice(0, 8)
+      .map(
+        (site) =>
+          `<li><a href="${escapeText(site.url)}" target="_blank" rel="noreferrer noopener">${escapeText(
+            site.displayName
+          )}</a><div class="meta">${escapeText(site.slug)}.bdfz.net · ${formatDate(
+            site.createdAt
+          )}</div></li>`
+      )
+      .join("")
     : `<li class="meta">尚無已註冊站點</li>`;
 }
 
@@ -112,36 +134,33 @@ async function refreshFeed() {
 
   globalFeedEl.innerHTML = posts.length
     ? posts
-        .slice(0, 8)
-        .map(
-          (post) =>
-            `<li><a href="${escapeText(post.url)}" target="_blank" rel="noreferrer noopener">${escapeText(
-              post.title
-            )}</a><div class="meta">${escapeText(post.siteName)} · ${formatDate(post.updatedAt)}</div></li>`
-        )
-        .join("")
+      .slice(0, 8)
+      .map(
+        (post) =>
+          `<li><a href="${escapeText(post.url)}" target="_blank" rel="noreferrer noopener">${escapeText(
+            post.title
+          )}</a><div class="meta">${escapeText(post.siteName)} · ${formatDate(post.updatedAt)}</div></li>`
+      )
+      .join("")
     : `<li class="meta">尚無公開文章</li>`;
 }
+
+/* ── Slug check ── */
 
 async function checkSlug() {
   const slug = normalizeSlug(slugInput.value);
   slugInput.value = slug;
-
-  if (!slug) {
-    setStatus("");
-    return;
-  }
+  if (!slug) { setStatus(""); return; }
 
   try {
     const payload = await fetchJson(`/api/check-slug?slug=${encodeURIComponent(slug)}`);
     if (payload.available) {
-      setStatus(`可使用：${slug}.bdfz.net`);
+      setStatus(`✓ 可使用：${slug}.bdfz.net`);
       return;
     }
-
-    setStatus(`不可使用（${payload.reason || "unknown"}）`, true);
+    setStatus(`✗ 不可使用（${payload.reason || "unknown"}）`, true);
   } catch {
-    setStatus("暫時無法檢查 slug，請稍後再試", true);
+    setStatus("無法檢查 slug，請稍後再試", true);
   }
 }
 
@@ -150,7 +169,6 @@ slugInput.addEventListener("input", () => {
   if (!nameInput.value.trim()) {
     nameInput.value = slugInput.value;
   }
-
   clearTimeout(timer);
   timer = setTimeout(checkSlug, 240);
 });
@@ -159,13 +177,15 @@ siteFilterInput.addEventListener("input", () => {
   renderSites(allSites);
 });
 
+/* ── Register ── */
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
   const payload = {
     slug: normalizeSlug(slugInput.value),
     displayName: nameInput.value.trim(),
-    adminPassword: document.getElementById("adminPassword").value,
+    adminPassword: pwdInput.value,
     inviteCode: document.getElementById("inviteCode").value.trim(),
     description: document.getElementById("description").value.trim(),
   };
@@ -175,7 +195,7 @@ form.addEventListener("submit", async (event) => {
     return;
   }
 
-  setStatus("正在建立站點...");
+  setStatus("正在建立站點…");
 
   try {
     const result = await fetchJson("/api/register", {
@@ -184,7 +204,7 @@ form.addEventListener("submit", async (event) => {
       body: JSON.stringify(payload),
     });
 
-    setStatus("建立成功，跳轉中...");
+    setStatus("建立成功，跳轉中…");
     await Promise.all([refreshSites(), refreshFeed()]);
     window.location.href = `${result.siteUrl}/admin`;
   } catch (error) {
@@ -192,11 +212,13 @@ form.addEventListener("submit", async (event) => {
   }
 });
 
+/* ── Polling ── */
+
 async function refreshAll() {
   try {
     await Promise.all([refreshSites(), refreshFeed()]);
   } catch (error) {
-    setStatus(error.message || "資料載入失敗", true);
+    console.error("Refresh failed:", error.message);
   }
 }
 

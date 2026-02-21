@@ -25,6 +25,10 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const DEFAULT_API_ENTRY_SLUG = "app";
 const SITE_CONFIG_VERSION = 2;
 
+const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_MAX_ATTEMPTS = 5;
+const loginAttempts = new Map();
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -550,6 +554,15 @@ async function handleApi(request, env, ctx, context) {
       return json({ error: "Login must happen on site subdomain" }, 400);
     }
 
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const rateKey = `${clientIp}:${hostSlug}`;
+    const now = Date.now();
+    const attempts = loginAttempts.get(rateKey) || [];
+    const recent = attempts.filter((t) => now - t < LOGIN_RATE_WINDOW_MS);
+    if (recent.length >= LOGIN_RATE_MAX_ATTEMPTS) {
+      return json({ error: "Too many login attempts, please try later" }, 429);
+    }
+
     const body = await readJson(request);
     const password = String(body.password || "");
     const slug = String(body.slug || hostSlug)
@@ -567,9 +580,12 @@ async function handleApi(request, env, ctx, context) {
 
     const verified = await verifyPassword(password, site.adminSecretHash, env);
     if (!verified) {
+      recent.push(now);
+      loginAttempts.set(rateKey, recent);
       return json({ error: "Invalid credentials" }, 401);
     }
 
+    loginAttempts.delete(rateKey);
     const token = await createSessionToken(site.slug, env);
     const response = json({ ok: true }, 200);
     return withCookie(response, buildSessionCookie(token));
@@ -781,6 +797,142 @@ async function handleApi(request, env, ctx, context) {
         "Content-Type": "application/json; charset=utf-8",
         "Content-Disposition": `attachment; filename="${filename}"`,
       },
+    });
+  }
+
+  if (request.method === "POST" && path === "/api/import") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    let formData;
+    try {
+      formData = await request.formData();
+    } catch {
+      return json({ error: "Invalid form data" }, 400);
+    }
+
+    const file = formData.get("file");
+    if (!file || typeof file.text !== "function") {
+      return json({ error: "No file uploaded" }, 400);
+    }
+
+    let csvText;
+    try {
+      csvText = await file.text();
+    } catch {
+      return json({ error: "Failed to read file" }, 400);
+    }
+
+    if (!csvText || csvText.length < 10) {
+      return json({ error: "File is empty or too small" }, 400);
+    }
+
+    if (csvText.length > 10 * 1024 * 1024) {
+      return json({ error: "File too large (max 10MB)" }, 400);
+    }
+
+    const parsed = parseCSV(csvText);
+    if (!parsed.headers.length || !parsed.rows.length) {
+      return json({ error: "No valid rows found in CSV" }, 400);
+    }
+
+    const imported = [];
+    const skipped = [];
+    const errors = [];
+
+    for (const row of parsed.rows) {
+      try {
+        const title = String(row.title || "").trim();
+        if (!title) {
+          skipped.push({ reason: "missing title" });
+          continue;
+        }
+
+        if (String(row.is_page || "").toLowerCase() === "true") {
+          skipped.push({ title, reason: "is_page" });
+          continue;
+        }
+
+        let rawSlug = String(row.slug || row.link || "").trim();
+        rawSlug = rawSlug.replace(/^\/+/, "");
+        let postSlug = rawSlug ? slugifyValue(rawSlug) : slugifyValue(title);
+        if (!postSlug) {
+          postSlug = slugifyValue(title);
+        }
+        if (!postSlug) {
+          skipped.push({ title, reason: "cannot derive slug" });
+          continue;
+        }
+
+        const slugCheck = validatePostSlug(postSlug);
+        if (!slugCheck.ok) {
+          postSlug = slugifyValue(title);
+          const recheck = validatePostSlug(postSlug);
+          if (!recheck.ok) {
+            skipped.push({ title, reason: "invalid slug" });
+            continue;
+          }
+          postSlug = recheck.slug;
+        } else {
+          postSlug = slugCheck.slug;
+        }
+
+        const content = String(row.content || "").trim();
+        const description = String(row.meta_description || "").trim().slice(0, 240);
+
+        let publishedDate = String(row.published_date || "").trim();
+        let createdAt;
+        if (publishedDate) {
+          const d = new Date(publishedDate);
+          createdAt = Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+        } else {
+          createdAt = new Date().toISOString();
+        }
+
+        const discoverable = String(row.make_discoverable || "true").toLowerCase();
+        const published = discoverable === "false" ? 0 : 1;
+
+        await githubWriteFile(
+          env,
+          getPostFilePath(site.slug, postSlug),
+          content || `# ${title}\n`,
+          `import(${site.slug}): ${postSlug} from BearBlog`
+        );
+
+        await upsertPostMeta(
+          env,
+          site.id,
+          postSlug,
+          sanitizeTitle(title),
+          sanitizeDescription(description),
+          published,
+          createdAt,
+          createdAt
+        );
+
+        imported.push({ title, postSlug });
+      } catch (error) {
+        errors.push({ title: row.title || "unknown", error: error.message || "unknown error" });
+      }
+    }
+
+    return json({
+      ok: true,
+      imported: imported.length,
+      skipped: skipped.length,
+      errors: errors.length,
+      details: { imported, skipped, errors },
     });
   }
 
@@ -1176,18 +1328,18 @@ function normalizeSiteConfig(rawConfig, site) {
   const base = site
     ? defaultSiteConfigFromSiteBase(site)
     : {
-        slug: "",
-        displayName: "",
-        description: "",
-        heroTitle: "",
-        heroSubtitle: "",
-        accentColor: "#7b5034",
-        footerNote: "在這裡，把語文寫成你自己。",
-        headerLinks: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        exportVersion: SITE_CONFIG_VERSION,
-      };
+      slug: "",
+      displayName: "",
+      description: "",
+      heroTitle: "",
+      heroSubtitle: "",
+      accentColor: "#7b5034",
+      footerNote: "在這裡，把語文寫成你自己。",
+      headerLinks: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      exportVersion: SITE_CONFIG_VERSION,
+    };
 
   const merged = {
     ...base,
@@ -1556,10 +1708,87 @@ function normalizePath(pathname) {
   return path;
 }
 
+function parseCSV(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const result = { headers: [], rows: [] };
+  let i = 0;
+  const len = lines.length;
+
+  function parseField() {
+    if (i >= len || lines[i] === "\n") return "";
+    if (lines[i] === '"') {
+      i++;
+      let val = "";
+      while (i < len) {
+        if (lines[i] === '"') {
+          if (i + 1 < len && lines[i + 1] === '"') {
+            val += '"';
+            i += 2;
+          } else {
+            i++;
+            break;
+          }
+        } else {
+          val += lines[i];
+          i++;
+        }
+      }
+      return val;
+    }
+    let val = "";
+    while (i < len && lines[i] !== "," && lines[i] !== "\n") {
+      val += lines[i];
+      i++;
+    }
+    return val;
+  }
+
+  function parseRow() {
+    const fields = [];
+    while (i < len && lines[i] !== "\n") {
+      fields.push(parseField());
+      if (i < len && lines[i] === ",") i++;
+    }
+    if (i < len && lines[i] === "\n") i++;
+    return fields;
+  }
+
+  if (len === 0) return result;
+
+  result.headers = parseRow().map((h) => h.trim().toLowerCase().replace(/\s+/g, "_"));
+  if (!result.headers.length) return result;
+
+  while (i < len) {
+    if (lines[i] === "\n") { i++; continue; }
+    const fields = parseRow();
+    if (fields.length === 0 || (fields.length === 1 && !fields[0])) continue;
+    const obj = {};
+    for (let j = 0; j < result.headers.length; j++) {
+      obj[result.headers[j]] = j < fields.length ? fields[j] : "";
+    }
+    result.rows.push(obj);
+  }
+
+  return result;
+}
+
+const MAX_BODY_BYTES = 65536;
+
 async function readJson(request) {
   try {
-    return await request.json();
-  } catch {
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > MAX_BODY_BYTES) {
+      throw new Error("Request body too large");
+    }
+    const text = await request.text();
+    if (text.length > MAX_BODY_BYTES) {
+      throw new Error("Request body too large");
+    }
+    return JSON.parse(text);
+  } catch (error) {
+    if (error && error.message === "Request body too large") {
+      throw error;
+    }
     return {};
   }
 }
@@ -1606,6 +1835,10 @@ function html(body, status = 200) {
     status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
+      "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data: https:; frame-ancestors 'none'",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
     },
   });
 }
@@ -1827,49 +2060,49 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
 
   const navLinks = (siteConfig.headerLinks || []).length
     ? `<nav class="site-nav">${siteConfig.headerLinks
-        .map(
-          (item) =>
-            `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
-              item.label
-            )}</a>`
-        )
-        .join("")}</nav>`
+      .map(
+        (item) =>
+          `<a href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+            item.label
+          )}</a>`
+      )
+      .join("")}</nav>`
     : "";
 
   const list = posts.length
     ? posts
-        .map(
-          (post) => `
+      .map(
+        (post) => `
           <li class="post-item">
             <a href="/${encodeURIComponent(post.postSlug)}" class="post-link">${escapeHtml(post.title)}</a>
             <p class="muted">${escapeHtml(post.description || "")}</p>
             <small>${escapeHtml(formatDate(post.updatedAt))}</small>
           </li>
         `
-        )
-        .join("\n")
+      )
+      .join("\n")
     : `<p class="muted">還沒有已發佈文章。</p>`;
 
   const peerSites = communitySites.length
     ? communitySites
-        .map(
-          (peer) =>
-            `<li><a href="${escapeHtml(peer.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
-              peer.displayName
-            )}</a><span class="muted"> · ${escapeHtml(peer.slug)}.bdfz.net</span></li>`
-        )
-        .join("")
+      .map(
+        (peer) =>
+          `<li><a href="${escapeHtml(peer.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+            peer.displayName
+          )}</a><span class="muted"> · ${escapeHtml(peer.slug)}.bdfz.net</span></li>`
+      )
+      .join("")
     : `<li class="muted">暫時沒有其他同學站點。</li>`;
 
   const feedItems = campusFeed.length
     ? campusFeed
-        .map(
-          (entry) =>
-            `<li><a href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
-              entry.title
-            )}</a><span class="muted"> · ${escapeHtml(entry.siteName)}</span></li>`
-        )
-        .join("")
+      .map(
+        (entry) =>
+          `<li><a href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+            entry.title
+          )}</a><span class="muted"> · ${escapeHtml(entry.siteName)}</span></li>`
+      )
+      .join("")
     : `<li class="muted">全校文章流暫時為空。</li>`;
 
   return renderLayout(
@@ -1904,8 +2137,8 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
       </div>
 
       <footer class="site-footer muted">${escapeHtml(
-        siteConfig.footerNote || "在這裡，把語文寫成你自己。"
-      )}</footer>
+      siteConfig.footerNote || "在這裡，把語文寫成你自己。"
+    )}</footer>
     </section>
   `
   );
@@ -1914,25 +2147,30 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
 function renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain) {
   const peerSites = communitySites.length
     ? communitySites
-        .map(
-          (peer) =>
-            `<li><a href="${escapeHtml(peer.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
-              peer.displayName
-            )}</a></li>`
-        )
-        .join("")
+      .map(
+        (peer) =>
+          `<li><a href="${escapeHtml(peer.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+            peer.displayName
+          )}</a></li>`
+      )
+      .join("")
     : `<li class="muted">暫時沒有其他同學站點。</li>`;
+
+  // Estimate read time (~400 chars/min for Chinese)
+  const charCount = articleHtml.replace(/<[^>]+>/g, "").length;
+  const readMinutes = Math.max(1, Math.round(charCount / 400));
 
   return renderLayout(
     `${post.title} - ${site.displayName}`,
     `
+    <div class="reading-progress" id="reading-progress"></div>
     <section class="panel wide article-wrap" style="--accent:${escapeHtml(siteConfig.accentColor)};">
       <article class="article">
         <p class="eyebrow"><a href="/">← ${escapeHtml(site.displayName)}</a> · ${escapeHtml(
-          site.slug
-        )}.${escapeHtml(baseDomain)}</p>
+      site.slug
+    )}.${escapeHtml(baseDomain)}</p>
         <h1>${escapeHtml(post.title)}</h1>
-        <p class="muted">${escapeHtml(formatDate(post.updatedAt))}</p>
+        <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span></p>
         <div class="article-body">${articleHtml}</div>
       </article>
       <aside class="article-side">
@@ -1940,6 +2178,29 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
         <ul class="mini-list">${peerSites}</ul>
       </aside>
     </section>
+    <button class="back-top" id="back-top" aria-label="Back to top">↑</button>
+    <script>
+      (function() {
+        const progress = document.getElementById('reading-progress');
+        const backTop = document.getElementById('back-top');
+        function onScroll() {
+          const scrollTop = window.scrollY;
+          const docHeight = document.documentElement.scrollHeight - window.innerHeight;
+          if (docHeight > 0 && progress) {
+            progress.style.width = Math.min(100, (scrollTop / docHeight) * 100) + '%';
+          }
+          if (backTop) {
+            backTop.classList.toggle('visible', scrollTop > 400);
+          }
+        }
+        window.addEventListener('scroll', onScroll, { passive: true });
+        if (backTop) {
+          backTop.addEventListener('click', function() {
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          });
+        }
+      })();
+    </script>
   `
   );
 }
@@ -2020,25 +2281,34 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
       <div class="admin-grid">
         <aside class="admin-list">
-          <p class="muted">Site Settings</p>
-          <label>顯示名稱</label>
-          <input id="siteDisplayName" maxlength="60" />
-          <label>站點簡介</label>
-          <input id="siteDescription" maxlength="240" />
-          <label>首頁標題</label>
-          <input id="siteHeroTitle" maxlength="120" />
-          <label>首頁副標</label>
-          <input id="siteHeroSubtitle" maxlength="240" />
-          <label>主色</label>
-          <input id="siteAccentColor" maxlength="7" placeholder="#7b5034" />
-          <label>頁尾文字</label>
-          <input id="siteFooterNote" maxlength="240" />
-          <label>外部連結（每行：標題|https://url）</label>
-          <textarea id="siteHeaderLinks" class="small-textarea" placeholder="作品集|https://example.com"></textarea>
-          <button id="save-settings" type="button">儲存站點設定</button>
+          <button id="settings-toggle" class="settings-toggle" type="button">▸ Site Settings</button>
+          <div id="settings-section" class="settings-section">
+            <p class="muted">Site Settings</p>
+            <label>顯示名稱</label>
+            <input id="siteDisplayName" maxlength="60" />
+            <label>站點簡介</label>
+            <input id="siteDescription" maxlength="240" />
+            <label>首頁標題</label>
+            <input id="siteHeroTitle" maxlength="120" />
+            <label>首頁副標</label>
+            <input id="siteHeroSubtitle" maxlength="240" />
+            <label>主色</label>
+            <input id="siteAccentColor" maxlength="7" placeholder="#7b5034" />
+            <label>頁尾文字</label>
+            <input id="siteFooterNote" maxlength="240" />
+            <label>外部連結（每行：標題|https://url）</label>
+            <textarea id="siteHeaderLinks" class="small-textarea" placeholder="作品集|https://example.com"></textarea>
+            <button id="save-settings" type="button">儲存站點設定</button>
+          </div>
 
           <p class="muted">Posts</p>
           <ul id="post-list"></ul>
+
+          <p class="muted" style="margin-top:0.8rem">Import</p>
+          <label>從 BearBlog 匯入 CSV</label>
+          <input id="import-file" type="file" accept=".csv" />
+          <button id="import-btn" type="button">匯入</button>
+          <p id="import-status" class="muted"></p>
         </aside>
 
         <section class="admin-editor">
@@ -2057,24 +2327,33 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
           </label>
 
           <label>Content</label>
+          <div class="md-toolbar">
+            <button type="button" data-md="bold" title="Bold">B</button>
+            <button type="button" data-md="italic" title="Italic">I</button>
+            <button type="button" data-md="code" title="Code">&#96;</button>
+            <button type="button" data-md="heading" title="Heading">H</button>
+            <button type="button" data-md="link" title="Link">🔗</button>
+            <button type="button" data-md="list" title="List">•</button>
+            <button type="button" id="fullscreen-toggle" class="fullscreen-btn">⛶ 全屏</button>
+          </div >
           <textarea id="content" placeholder="# Start writing..."></textarea>
 
           <div class="row-actions">
-            <button id="save" type="button">Save (Cmd/Ctrl + S)</button>
+            <button id="save" type="button">Save (⌘/Ctrl + S)</button>
             <a id="preview" class="link-button" href="#" target="_blank" rel="noreferrer noopener">Open</a>
           </div>
 
           <p id="editor-status" class="muted"></p>
-        </section>
-      </div>
-    </section>
+        </section >
+      </div >
+    </section >
 
     <script>
       const initialConfig = ${toScriptJson(siteConfig)};
       const state = {
         currentSlug: '',
-        posts: [],
-        siteConfig: initialConfig,
+      posts: [],
+      siteConfig: initialConfig,
       };
 
       const postList = document.getElementById('post-list');
@@ -2095,316 +2374,423 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
-        statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+      statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
       }
 
       function toSlug(value) {
         return String(value || '')
-          .toLowerCase()
-          .trim()
-          .replace(/[^a-z0-9\s-]/g, '')
-          .replace(/\s+/g, '-')
-          .replace(/-+/g, '-')
-          .replace(/^-|-$/g, '')
-          .slice(0, 80);
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 80);
       }
 
       function normalizeHexColor(value) {
         const raw = String(value || '').trim().toLowerCase();
-        if (/^#[0-9a-f]{6}$/.test(raw)) {
+      if (/^#[0-9a-f]{6}$/.test(raw)) {
           return raw;
         }
-        if (/^#[0-9a-f]{3}$/.test(raw)) {
+      if (/^#[0-9a-f]{3}$/.test(raw)) {
           return '#' + raw[1] + raw[1] + raw[2] + raw[2] + raw[3] + raw[3];
         }
-        return '#7b5034';
+      return '#7b5034';
       }
 
       function escapeText(value) {
         return String(value || '')
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#39;');
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function parseHeaderLinks(raw) {
+  return String(raw || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((line) => {
+      const [label, url] = line.split('|').map((item) => item.trim());
+      if (!label || !url || !/^https?:\/\//i.test(url)) {
+        return null;
       }
+      return { label: label.slice(0, 24), url: url.slice(0, 240) };
+    })
+    .filter(Boolean);
+}
 
-      function parseHeaderLinks(raw) {
-        return String(raw || '')
-          .split('\\n')
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .slice(0, 8)
-          .map((line) => {
-            const [label, url] = line.split('|').map((item) => item.trim());
-            if (!label || !url || !/^https?:\\/\\//i.test(url)) {
-              return null;
-            }
-            return { label: label.slice(0, 24), url: url.slice(0, 240) };
-          })
-          .filter(Boolean);
+function renderHeaderLinksValue(links) {
+  return (links || [])
+    .map((item) => item.label + '|' + item.url)
+    .join('\n');
+}
+
+function applySettingsToForm(config) {
+  const safe = config || {};
+  siteDisplayNameInput.value = safe.displayName || '';
+  siteDescriptionInput.value = safe.description || '';
+  siteHeroTitleInput.value = safe.heroTitle || '';
+  siteHeroSubtitleInput.value = safe.heroSubtitle || '';
+  siteAccentColorInput.value = normalizeHexColor(safe.accentColor || '#7b5034');
+  siteFooterNoteInput.value = safe.footerNote || '';
+  siteHeaderLinksInput.value = renderHeaderLinksValue(safe.headerLinks || []);
+}
+
+function draftKey(slug) {
+  const id = slug || 'new';
+  return 'stublogs-draft:' + location.host + ':' + id;
+}
+
+function saveDraft() {
+  const key = draftKey(state.currentSlug);
+  const payload = {
+    title: titleInput.value,
+    postSlug: postSlugInput.value,
+    description: descriptionInput.value,
+    content: contentInput.value,
+    published: publishedInput.checked,
+    savedAt: Date.now(),
+  };
+
+  try {
+    localStorage.setItem(key, JSON.stringify(payload));
+  } catch {
+    // ignore localStorage quota errors
+  }
+}
+
+function tryRestoreDraft(slug) {
+  const key = draftKey(slug);
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return;
+    }
+    const draft = JSON.parse(raw);
+    if (!draft || !draft.content) {
+      return;
+    }
+
+    if (!contentInput.value.trim()) {
+      titleInput.value = draft.title || titleInput.value;
+      postSlugInput.value = draft.postSlug || postSlugInput.value;
+      descriptionInput.value = draft.description || descriptionInput.value;
+      contentInput.value = draft.content || contentInput.value;
+      publishedInput.checked = Boolean(draft.published);
+      syncPreview();
+    }
+  } catch {
+    // ignore malformed drafts
+  }
+}
+
+function syncPreview() {
+  const slug = postSlugInput.value.trim().toLowerCase();
+  previewLink.href = slug ? '/' + encodeURIComponent(slug) : '#';
+}
+
+function resetEditor() {
+  state.currentSlug = '';
+  titleInput.value = '';
+  postSlugInput.value = '';
+  descriptionInput.value = '';
+  publishedInput.checked = false;
+  contentInput.value = '';
+  syncPreview();
+  setStatus('New post');
+  tryRestoreDraft('');
+}
+
+function renderPostList() {
+  if (!state.posts.length) {
+    postList.innerHTML = '<li class="muted">No posts yet</li>';
+    return;
+  }
+
+  postList.innerHTML = state.posts
+    .map((post) => {
+      const activeClass = post.postSlug === state.currentSlug ? 'active' : '';
+      const stateLabel = Number(post.published) === 1 ? 'Published' : 'Draft';
+      return '<li><button class="post-item-btn ' + activeClass + '" data-slug="' +
+        post.postSlug + '">' +
+        escapeText(post.title) +
+        ' <small>(' + stateLabel + ')</small></button></li>';
+    })
+    .join('');
+
+  Array.from(document.querySelectorAll('.post-item-btn')).forEach((button) => {
+    button.addEventListener('click', () => {
+      loadPost(button.getAttribute('data-slug'));
+    });
+  });
+}
+
+async function fetchJson(path, options) {
+  const response = await fetch(path, options);
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || 'Request failed');
+  }
+  return payload;
+}
+
+async function refreshPosts() {
+  const payload = await fetchJson('/api/list-posts?includeDrafts=1');
+  state.posts = payload.posts || [];
+  renderPostList();
+}
+
+async function refreshSettings() {
+  const payload = await fetchJson('/api/site-settings');
+  state.siteConfig = payload.config || state.siteConfig;
+  applySettingsToForm(state.siteConfig);
+}
+
+async function loadPost(slug) {
+  if (!slug) {
+    return;
+  }
+
+  try {
+    const payload = await fetchJson('/api/posts/' + encodeURIComponent(slug));
+    const post = payload.post;
+    state.currentSlug = post.postSlug;
+    titleInput.value = post.title || '';
+    postSlugInput.value = post.postSlug || '';
+    descriptionInput.value = post.description || '';
+    publishedInput.checked = Number(post.published) === 1;
+    contentInput.value = post.content || '';
+    syncPreview();
+    renderPostList();
+    tryRestoreDraft(post.postSlug);
+    setStatus('Loaded ' + post.postSlug);
+  } catch (error) {
+    setStatus(error.message || 'Failed to load post', true);
+  }
+}
+
+async function savePost() {
+  const title = titleInput.value.trim();
+  const postSlug = (postSlugInput.value.trim() || toSlug(title)).toLowerCase();
+
+  if (!title) {
+    setStatus('Title is required', true);
+    return;
+  }
+
+  if (!postSlug) {
+    setStatus('Post slug is required', true);
+    return;
+  }
+
+  setStatus('Saving...');
+
+  try {
+    const payload = await fetchJson('/api/posts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title,
+        postSlug,
+        description: descriptionInput.value.trim(),
+        content: contentInput.value,
+        published: publishedInput.checked,
+      }),
+    });
+
+    state.currentSlug = payload.post.postSlug;
+    postSlugInput.value = payload.post.postSlug;
+    syncPreview();
+    await refreshPosts();
+    setStatus('Saved at ' + new Date().toLocaleTimeString());
+    saveDraft();
+  } catch (error) {
+    setStatus(error.message || 'Save failed', true);
+  }
+}
+
+async function saveSiteSettings() {
+  setStatus('Saving site settings...');
+  try {
+    const payload = await fetchJson('/api/site-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: siteDisplayNameInput.value.trim(),
+        description: siteDescriptionInput.value.trim(),
+        heroTitle: siteHeroTitleInput.value.trim(),
+        heroSubtitle: siteHeroSubtitleInput.value.trim(),
+        accentColor: normalizeHexColor(siteAccentColorInput.value),
+        footerNote: siteFooterNoteInput.value.trim(),
+        headerLinks: parseHeaderLinks(siteHeaderLinksInput.value),
+      }),
+    });
+
+    state.siteConfig = payload.config || state.siteConfig;
+    applySettingsToForm(state.siteConfig);
+    document.documentElement.style.setProperty('--accent', state.siteConfig.accentColor || '#7b5034');
+    setStatus('Site settings saved');
+  } catch (error) {
+    setStatus(error.message || 'Failed to save site settings', true);
+  }
+}
+
+document.getElementById('new-post').addEventListener('click', resetEditor);
+document.getElementById('save').addEventListener('click', savePost);
+document.getElementById('save-settings').addEventListener('click', saveSiteSettings);
+document.getElementById('logout').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  location.reload();
+});
+
+titleInput.addEventListener('blur', () => {
+  if (!postSlugInput.value.trim()) {
+    postSlugInput.value = toSlug(titleInput.value);
+    syncPreview();
+  }
+});
+
+postSlugInput.addEventListener('input', () => {
+  postSlugInput.value = toSlug(postSlugInput.value);
+  syncPreview();
+});
+
+contentInput.addEventListener('input', saveDraft);
+titleInput.addEventListener('input', saveDraft);
+descriptionInput.addEventListener('input', saveDraft);
+publishedInput.addEventListener('change', saveDraft);
+
+document.addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    if (event.shiftKey) {
+      saveSiteSettings();
+    } else {
+      savePost();
+    }
+  }
+});
+
+applySettingsToForm(initialConfig);
+resetEditor();
+refreshSettings().catch((error) => {
+  setStatus(error.message || 'Failed to load site settings', true);
+});
+refreshPosts().catch((error) => {
+  setStatus(error.message || 'Failed to load posts', true);
+});
+
+// ── Settings toggle (mobile) ──
+const settingsToggle = document.getElementById('settings-toggle');
+const settingsSection = document.getElementById('settings-section');
+if (settingsToggle && settingsSection) {
+  if (window.innerWidth <= 860) {
+    settingsSection.classList.add('collapsed');
+  }
+  settingsToggle.addEventListener('click', () => {
+    const collapsed = settingsSection.classList.toggle('collapsed');
+    settingsToggle.textContent = (collapsed ? '▸' : '▾') + ' Site Settings';
+  });
+}
+
+// ── Markdown toolbar ──
+function insertMd(type) {
+  const ta = contentInput;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const sel = ta.value.substring(start, end);
+  let before = '', after = '';
+  switch (type) {
+    case 'bold': before = '**'; after = '**'; break;
+    case 'italic': before = '*'; after = '*'; break;
+    case 'code': before = sel.includes('\n') ? '\n' + String.fromCharCode(96,96,96) + '\n' : String.fromCharCode(96); after = sel.includes('\n') ? '\n' + String.fromCharCode(96,96,96) + '\n' : String.fromCharCode(96); break;
+    case 'heading': before = '## '; break;
+    case 'link': before = '['; after = '](https://)'; break;
+    case 'list': before = '- '; break;
+  }
+  const replacement = before + (sel || type) + after;
+  ta.setRangeText(replacement, start, end, 'end');
+  ta.focus();
+  saveDraft();
+}
+
+document.querySelectorAll('.md-toolbar button[data-md]').forEach((btn) => {
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    insertMd(btn.getAttribute('data-md'));
+  });
+});
+
+// ── Fullscreen editor ──
+const fsToggle = document.getElementById('fullscreen-toggle');
+if (fsToggle) {
+  fsToggle.addEventListener('click', () => {
+    const overlay = document.createElement('div');
+    overlay.className = 'editor-fullscreen';
+    const fsTextarea = document.createElement('textarea');
+    fsTextarea.value = contentInput.value;
+    fsTextarea.placeholder = '# Start writing...';
+    const actions = document.createElement('div');
+    actions.className = 'fs-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save & Close';
+    saveBtn.addEventListener('click', () => {
+      contentInput.value = fsTextarea.value;
+      saveDraft();
+      overlay.remove();
+    });
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.background = 'transparent';
+    cancelBtn.style.borderColor = 'var(--line)';
+    cancelBtn.style.color = 'var(--muted)';
+    cancelBtn.addEventListener('click', () => overlay.remove());
+    actions.appendChild(saveBtn);
+    actions.appendChild(cancelBtn);
+    overlay.appendChild(fsTextarea);
+    overlay.appendChild(actions);
+    document.body.appendChild(overlay);
+    fsTextarea.focus();
+  });
+}
+// ── BearBlog import ──
+const importBtn = document.getElementById('import-btn');
+const importFile = document.getElementById('import-file');
+const importStatus = document.getElementById('import-status');
+if (importBtn && importFile) {
+  importBtn.addEventListener('click', async () => {
+    const file = importFile.files[0];
+    if (!file) {
+      importStatus.textContent = 'Please select a CSV file';
+      return;
+    }
+    importStatus.textContent = 'Importing...';
+    importBtn.disabled = true;
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch('/api/import', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!res.ok) {
+        importStatus.textContent = data.error || 'Import failed';
+        importStatus.style.color = 'var(--accent)';
+        return;
       }
-
-      function renderHeaderLinksValue(links) {
-        return (links || [])
-          .map((item) => item.label + '|' + item.url)
-          .join('\\n');
-      }
-
-      function applySettingsToForm(config) {
-        const safe = config || {};
-        siteDisplayNameInput.value = safe.displayName || '';
-        siteDescriptionInput.value = safe.description || '';
-        siteHeroTitleInput.value = safe.heroTitle || '';
-        siteHeroSubtitleInput.value = safe.heroSubtitle || '';
-        siteAccentColorInput.value = normalizeHexColor(safe.accentColor || '#7b5034');
-        siteFooterNoteInput.value = safe.footerNote || '';
-        siteHeaderLinksInput.value = renderHeaderLinksValue(safe.headerLinks || []);
-      }
-
-      function draftKey(slug) {
-        const id = slug || 'new';
-        return 'stublogs-draft:' + location.host + ':' + id;
-      }
-
-      function saveDraft() {
-        const key = draftKey(state.currentSlug);
-        const payload = {
-          title: titleInput.value,
-          postSlug: postSlugInput.value,
-          description: descriptionInput.value,
-          content: contentInput.value,
-          published: publishedInput.checked,
-          savedAt: Date.now(),
-        };
-
-        try {
-          localStorage.setItem(key, JSON.stringify(payload));
-        } catch {
-          // ignore localStorage quota errors
-        }
-      }
-
-      function tryRestoreDraft(slug) {
-        const key = draftKey(slug);
-        try {
-          const raw = localStorage.getItem(key);
-          if (!raw) {
-            return;
-          }
-          const draft = JSON.parse(raw);
-          if (!draft || !draft.content) {
-            return;
-          }
-
-          if (!contentInput.value.trim()) {
-            titleInput.value = draft.title || titleInput.value;
-            postSlugInput.value = draft.postSlug || postSlugInput.value;
-            descriptionInput.value = draft.description || descriptionInput.value;
-            contentInput.value = draft.content || contentInput.value;
-            publishedInput.checked = Boolean(draft.published);
-            syncPreview();
-          }
-        } catch {
-          // ignore malformed drafts
-        }
-      }
-
-      function syncPreview() {
-        const slug = postSlugInput.value.trim().toLowerCase();
-        previewLink.href = slug ? '/' + encodeURIComponent(slug) : '#';
-      }
-
-      function resetEditor() {
-        state.currentSlug = '';
-        titleInput.value = '';
-        postSlugInput.value = '';
-        descriptionInput.value = '';
-        publishedInput.checked = false;
-        contentInput.value = '';
-        syncPreview();
-        setStatus('New post');
-        tryRestoreDraft('');
-      }
-
-      function renderPostList() {
-        if (!state.posts.length) {
-          postList.innerHTML = '<li class="muted">No posts yet</li>';
-          return;
-        }
-
-        postList.innerHTML = state.posts
-          .map((post) => {
-            const activeClass = post.postSlug === state.currentSlug ? 'active' : '';
-            const stateLabel = Number(post.published) === 1 ? 'Published' : 'Draft';
-            return '<li><button class="post-item-btn ' + activeClass + '" data-slug="' +
-              post.postSlug + '">' +
-              escapeText(post.title) +
-              ' <small>(' + stateLabel + ')</small></button></li>';
-          })
-          .join('');
-
-        Array.from(document.querySelectorAll('.post-item-btn')).forEach((button) => {
-          button.addEventListener('click', () => {
-            loadPost(button.getAttribute('data-slug'));
-          });
-        });
-      }
-
-      async function fetchJson(path, options) {
-        const response = await fetch(path, options);
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(payload.error || 'Request failed');
-        }
-        return payload;
-      }
-
-      async function refreshPosts() {
-        const payload = await fetchJson('/api/list-posts?includeDrafts=1');
-        state.posts = payload.posts || [];
-        renderPostList();
-      }
-
-      async function refreshSettings() {
-        const payload = await fetchJson('/api/site-settings');
-        state.siteConfig = payload.config || state.siteConfig;
-        applySettingsToForm(state.siteConfig);
-      }
-
-      async function loadPost(slug) {
-        if (!slug) {
-          return;
-        }
-
-        try {
-          const payload = await fetchJson('/api/posts/' + encodeURIComponent(slug));
-          const post = payload.post;
-          state.currentSlug = post.postSlug;
-          titleInput.value = post.title || '';
-          postSlugInput.value = post.postSlug || '';
-          descriptionInput.value = post.description || '';
-          publishedInput.checked = Number(post.published) === 1;
-          contentInput.value = post.content || '';
-          syncPreview();
-          renderPostList();
-          tryRestoreDraft(post.postSlug);
-          setStatus('Loaded ' + post.postSlug);
-        } catch (error) {
-          setStatus(error.message || 'Failed to load post', true);
-        }
-      }
-
-      async function savePost() {
-        const title = titleInput.value.trim();
-        const postSlug = (postSlugInput.value.trim() || toSlug(title)).toLowerCase();
-
-        if (!title) {
-          setStatus('Title is required', true);
-          return;
-        }
-
-        if (!postSlug) {
-          setStatus('Post slug is required', true);
-          return;
-        }
-
-        setStatus('Saving...');
-
-        try {
-          const payload = await fetchJson('/api/posts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              title,
-              postSlug,
-              description: descriptionInput.value.trim(),
-              content: contentInput.value,
-              published: publishedInput.checked,
-            }),
-          });
-
-          state.currentSlug = payload.post.postSlug;
-          postSlugInput.value = payload.post.postSlug;
-          syncPreview();
-          await refreshPosts();
-          setStatus('Saved at ' + new Date().toLocaleTimeString());
-          saveDraft();
-        } catch (error) {
-          setStatus(error.message || 'Save failed', true);
-        }
-      }
-
-      async function saveSiteSettings() {
-        setStatus('Saving site settings...');
-        try {
-          const payload = await fetchJson('/api/site-settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              displayName: siteDisplayNameInput.value.trim(),
-              description: siteDescriptionInput.value.trim(),
-              heroTitle: siteHeroTitleInput.value.trim(),
-              heroSubtitle: siteHeroSubtitleInput.value.trim(),
-              accentColor: normalizeHexColor(siteAccentColorInput.value),
-              footerNote: siteFooterNoteInput.value.trim(),
-              headerLinks: parseHeaderLinks(siteHeaderLinksInput.value),
-            }),
-          });
-
-          state.siteConfig = payload.config || state.siteConfig;
-          applySettingsToForm(state.siteConfig);
-          document.documentElement.style.setProperty('--accent', state.siteConfig.accentColor || '#7b5034');
-          setStatus('Site settings saved');
-        } catch (error) {
-          setStatus(error.message || 'Failed to save site settings', true);
-        }
-      }
-
-      document.getElementById('new-post').addEventListener('click', resetEditor);
-      document.getElementById('save').addEventListener('click', savePost);
-      document.getElementById('save-settings').addEventListener('click', saveSiteSettings);
-      document.getElementById('logout').addEventListener('click', async () => {
-        await fetch('/api/logout', { method: 'POST' });
-        location.reload();
-      });
-
-      titleInput.addEventListener('blur', () => {
-        if (!postSlugInput.value.trim()) {
-          postSlugInput.value = toSlug(titleInput.value);
-          syncPreview();
-        }
-      });
-
-      postSlugInput.addEventListener('input', () => {
-        postSlugInput.value = toSlug(postSlugInput.value);
-        syncPreview();
-      });
-
-      contentInput.addEventListener('input', saveDraft);
-      titleInput.addEventListener('input', saveDraft);
-      descriptionInput.addEventListener('input', saveDraft);
-      publishedInput.addEventListener('change', saveDraft);
-
-      document.addEventListener('keydown', (event) => {
-        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
-          event.preventDefault();
-          if (event.shiftKey) {
-            saveSiteSettings();
-          } else {
-            savePost();
-          }
-        }
-      });
-
-      applySettingsToForm(initialConfig);
-      resetEditor();
-      refreshSettings().catch((error) => {
-        setStatus(error.message || 'Failed to load site settings', true);
-      });
-      refreshPosts().catch((error) => {
-        setStatus(error.message || 'Failed to load posts', true);
-      });
+      importStatus.textContent = 'Imported ' + data.imported + ', skipped ' + data.skipped + ', errors ' + data.errors;
+      importStatus.style.color = '';
+      await refreshPosts();
+    } catch (e) {
+      importStatus.textContent = e.message || 'Import failed';
+    } finally {
+      importBtn.disabled = false;
+    }
+  });
+}
     </script>
   `
   );
@@ -2412,386 +2798,675 @@ function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
 function renderSimpleMessage(code, message) {
   return renderLayout(
-    `${code}`,
+    `${code} `,
     `
-    <section class="panel">
+  < section class="panel" >
       <p class="eyebrow">${escapeHtml(code)}</p>
       <h1>${escapeHtml(message)}</h1>
       <p class="muted"><a href="/">Back</a></p>
-    </section>
+    </section >
   `
   );
 }
 
 function renderLayout(title, body) {
-  return `<!doctype html>
-<html lang="zh-Hant">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap"
-      rel="stylesheet"
-    />
-    <title>${escapeHtml(title)}</title>
-    <style>
-      :root {
-        --bg-1: #f6f0e8;
+  return `< !doctype html >
+  <html lang="zh-Hant">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+      <link rel="preconnect" href="https://fonts.googleapis.com" />
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+      <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap"
+        rel="stylesheet"
+      />
+      <title>${escapeHtml(title)}</title>
+      <style>
+        :root {
+          --bg - 1: #f6f0e8;
         --bg-2: #eadfce;
         --ink: #2b261f;
+        --ink-2: #3d362d;
         --muted: #666052;
-        --panel: rgba(255, 252, 247, 0.9);
-        --line: rgba(57, 47, 38, 0.2);
+        --panel: rgba(255, 252, 247, 0.92);
+        --line: rgba(57, 47, 38, 0.15);
         --accent: #7b5034;
+        --accent-glow: rgba(123, 80, 52, 0.15);
+        --code-bg: rgba(90, 82, 69, 0.1);
+        --font-mono: 'Fira Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+        --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
       }
 
-      * {
-        box-sizing: border-box;
+        @media (prefers-color-scheme: dark) {
+        :root {
+          --bg - 1: #0f1318;
+        --bg-2: #141a22;
+        --ink: #c8cfd8;
+        --ink-2: #a0a8b4;
+        --muted: #6b7580;
+        --panel: rgba(20, 26, 34, 0.92);
+        --line: rgba(100, 180, 255, 0.08);
+        --accent: #5ca0d0;
+        --accent-glow: rgba(92, 160, 208, 0.12);
+        --code-bg: rgba(255, 255, 255, 0.06);
+        }
       }
 
-      body {
-        margin: 0;
-        color: var(--ink);
-        font-family: "Chivo", "Trebuchet MS", sans-serif;
-        background:
-          radial-gradient(900px 420px at 0% -10%, rgba(140, 99, 61, 0.16), transparent 60%),
-          radial-gradient(760px 380px at 100% 0%, rgba(96, 120, 137, 0.11), transparent 56%),
-          linear-gradient(160deg, var(--bg-1), var(--bg-2));
+        * {box - sizing: border-box; margin: 0; padding: 0; }
+
+        ::selection {
+          background: var(--accent-glow);
+      }
+
+        body {
+          color: var(--ink);
+        font-family: var(--font-sans);
+        background: linear-gradient(160deg, var(--bg-1), var(--bg-2));
         min-height: 100vh;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
       }
 
-      main {
-        width: min(980px, 92vw);
-        margin: 2.2rem auto;
+        /* ── Reading progress bar ── */
+        .reading-progress {
+          position: fixed;
+        top: 0;
+        left: 0;
+        height: 3px;
+        background: var(--accent);
+        width: 0%;
+        z-index: 9999;
+        transition: width 0.1s linear;
       }
 
-      .panel {
-        background: var(--panel);
+        main {
+          width: min(980px, 92vw);
+        margin: 2rem auto;
+      }
+
+        .panel {
+          background: var(--panel);
         border: 1px solid var(--line);
-        border-radius: 18px;
-        box-shadow: 0 14px 40px rgba(41, 33, 22, 0.08);
+        border-radius: 16px;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.06);
         padding: clamp(1.2rem, 3vw, 2rem);
-        backdrop-filter: blur(2px);
+        backdrop-filter: blur(8px);
       }
 
-      .wide {
-        width: 100%;
-      }
+        .wide {width: 100%; }
 
-      .eyebrow {
-        font-family: "JetBrains Mono", Menlo, Consolas, monospace;
+        .eyebrow {
+          font - family: var(--font-mono);
         letter-spacing: 0.08em;
         text-transform: uppercase;
         color: var(--muted);
-        font-size: 0.75rem;
+        font-size: 0.72rem;
         margin: 0;
       }
 
-      h1,
-      h2,
-      h3,
-      h4 {
-        margin: 0.35rem 0 0.7rem;
-        line-height: 1.2;
+        .eyebrow a {
+          color: var(--muted);
+        text-decoration: none;
+      }
+        .eyebrow a:hover {
+          color: var(--accent);
       }
 
-      .muted {
-        color: var(--muted);
+        h1, h2, h3, h4 {
+          margin: 0.35rem 0 0.7rem;
+        line-height: 1.25;
+        color: var(--ink);
       }
 
-      .stack {
-        display: grid;
+        h1 {font - weight: 700; }
+
+        .muted {color: var(--muted); }
+
+        .stack {
+          display: grid;
         gap: 0.6rem;
         margin-top: 1rem;
       }
 
-      label {
-        font-family: "JetBrains Mono", Menlo, Consolas, monospace;
-        font-size: 0.9rem;
+        label {
+          font - family: var(--font-mono);
+        font-size: 0.85rem;
+        color: var(--muted);
       }
 
-      input,
-      textarea,
-      button,
-      .link-button {
-        font: inherit;
+        input, textarea, button, .link-button {
+          font: inherit;
         border-radius: 10px;
       }
 
-      input,
-      textarea {
-        border: 1px solid var(--line);
-        background: rgba(255, 255, 255, 0.72);
-        padding: 0.65rem 0.75rem;
+        input, textarea {
+          border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.65);
+        padding: 0.65rem 0.78rem;
+        color: var(--ink);
+        font-family: var(--font-mono);
+        font-size: 0.92rem;
+        transition: border-color 0.2s, box-shadow 0.2s;
       }
 
-      textarea {
-        min-height: 360px;
+        @media (prefers-color-scheme: dark) {
+          input, textarea {
+          background: rgba(255, 255, 255, 0.05);
+        }
+      }
+
+        input:focus, textarea:focus {
+          outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-glow);
+      }
+
+        textarea {
+          min - height: 360px;
         resize: vertical;
-        line-height: 1.6;
+        line-height: 1.65;
       }
 
-      .small-textarea {
-        min-height: 110px;
-      }
+        .small-textarea {min - height: 110px; }
 
-      button,
-      .link-button {
-        display: inline-flex;
+        button, .link-button {
+          display: inline-flex;
         align-items: center;
         justify-content: center;
-        border: 0;
+        border: 1px solid var(--accent);
         cursor: pointer;
         padding: 0.62rem 0.95rem;
         background: var(--accent);
         color: #f7eee2;
         text-decoration: none;
+        font-weight: 500;
+        transition: all 0.2s;
+        min-height: 44px;
       }
 
-      button:hover,
-      .link-button:hover {
-        filter: brightness(1.05);
+        button:hover, .link-button:hover {
+          filter: brightness(1.08);
+        transform: translateY(-1px);
       }
 
-      .site-header {
-        display: flex;
+        button:active, .link-button:active {
+          transform: translateY(0);
+      }
+
+        .site-header {
+          display: flex;
         align-items: start;
         justify-content: space-between;
         gap: 1rem;
         margin-bottom: 1rem;
       }
 
-      .post-list {
-        display: grid;
+        .post-list {
+          display: grid;
         gap: 0.9rem;
         margin: 1rem 0 0;
         padding: 0;
         list-style: none;
       }
 
-      .post-item {
-        border-bottom: 1px dashed var(--line);
+        .post-item {
+          border - bottom: 1px dashed var(--line);
         padding-bottom: 0.7rem;
+        transition: transform 0.15s;
       }
 
-      .post-link {
-        text-decoration: none;
+        .post-item:hover {
+          transform: translateX(4px);
+      }
+
+        .post-link {
+          text - decoration: none;
         color: var(--ink);
-        font-size: 1.2rem;
+        font-size: 1.15rem;
+        font-weight: 600;
+        transition: color 0.2s;
       }
 
-      .site-nav {
-        display: flex;
+        .post-link:hover {
+          color: var(--accent);
+      }
+
+        .site-nav {
+          display: flex;
         flex-wrap: wrap;
         gap: 0.45rem;
         margin: 0.6rem 0 1rem;
       }
 
-      .site-nav a {
-        border: 1px solid var(--line);
+        .site-nav a {
+          border: 1px solid var(--line);
         border-radius: 999px;
         padding: 0.35rem 0.65rem;
         text-decoration: none;
         color: var(--ink);
-        font-size: 0.9rem;
+        font-size: 0.88rem;
+        transition: all 0.2s;
       }
 
-      .community-grid {
-        display: grid;
-        grid-template-columns: 1fr 320px;
-        gap: 1rem;
+        .site-nav a:hover {
+          border - color: var(--accent);
+        color: var(--accent);
       }
 
-      .community-panel {
-        border-left: 1px solid var(--line);
+        .community-grid {
+          display: grid;
+        grid-template-columns: 1fr 300px;
+        gap: 1.2rem;
+      }
+
+        .community-panel {
+          border - left: 1px solid var(--line);
         padding-left: 1rem;
       }
 
-      .mini-list {
-        list-style: none;
+        .mini-list {
+          list - style: none;
         padding: 0;
         margin: 0 0 1rem;
         display: grid;
-        gap: 0.4rem;
+        gap: 0.35rem;
       }
 
-      .mini-list li {
-        line-height: 1.45;
+        .mini-list li {
+          line - height: 1.5;
+        font-size: 0.92rem;
       }
 
-      .site-footer {
-        margin-top: 1rem;
+        .mini-list a {
+          text - decoration: none;
+        transition: color 0.2s;
+      }
+
+        .mini-list a:hover {
+          color: var(--accent);
+      }
+
+        .site-footer {
+          margin - top: 1.2rem;
         border-top: 1px dashed var(--line);
         padding-top: 0.75rem;
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
       }
 
-      .article-body {
-        line-height: 1.7;
+        /* ── Article ── */
+        .article-body {
+          line - height: 1.78;
+        font-size: 1.05rem;
       }
 
-      .article-wrap {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 250px;
-        gap: 1rem;
+        .article-body h2, .article-body h3, .article-body h4 {
+          margin - top: 1.6rem;
       }
 
-      .article-side {
-        border-left: 1px solid var(--line);
+        .article-body p {
+          margin: 0.8rem 0;
+      }
+
+        .article-body blockquote {
+          border - left: 3px solid var(--accent);
+        padding: 0.5rem 0 0.5rem 1rem;
+        margin: 1rem 0;
+        color: var(--muted);
+        background: var(--accent-glow);
+        border-radius: 0 8px 8px 0;
+      }
+
+        .article-body ul, .article-body ol {
+          padding - left: 1.4rem;
+        margin: 0.6rem 0;
+      }
+
+        .article-body img {
+          max - width: 100%;
+        border-radius: 8px;
+        margin: 0.8rem 0;
+      }
+
+        .article-wrap {
+          display: grid;
+        grid-template-columns: minmax(0, 1fr) 240px;
+        gap: 1.2rem;
+      }
+
+        .article-side {
+          border - left: 1px solid var(--line);
         padding-left: 0.9rem;
       }
 
-      .article-body pre {
-        background: rgba(47, 43, 36, 0.95);
-        color: #f8f5ee;
-        padding: 0.9rem;
+        .article-body pre {
+          background: rgba(30, 28, 24, 0.96);
+        color: #e8e4dc;
+        padding: 1rem;
         border-radius: 10px;
         overflow-x: auto;
+        font-size: 0.88rem;
+        line-height: 1.5;
+        margin: 0.8rem 0;
       }
 
-      .article-body code {
-        background: rgba(90, 82, 69, 0.13);
-        padding: 0.1rem 0.3rem;
-        border-radius: 5px;
+        @media (prefers-color-scheme: dark) {
+        .article - body pre {
+          background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--line);
+        }
       }
 
-      .admin-shell {
-        display: grid;
+        .article-body code {
+          background: var(--code-bg);
+        padding: 0.12rem 0.35rem;
+        border-radius: 4px;
+        font-size: 0.88em;
+        font-family: var(--font-mono);
+      }
+
+        .article-body pre code {
+          background: none;
+        padding: 0;
+        font-size: inherit;
+      }
+
+        .read-time {
+          font - family: var(--font-mono);
+        font-size: 0.78rem;
+        color: var(--muted);
+        margin-left: 0.5rem;
+      }
+
+        /* ── Back to top ── */
+        .back-top {
+          position: fixed;
+        bottom: 1.5rem;
+        right: 1.5rem;
+        width: 42px;
+        height: 42px;
+        border-radius: 50%;
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        font-size: 1.1rem;
+        cursor: pointer;
+        opacity: 0;
+        transform: translateY(10px);
+        transition: all 0.25s;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+        .back-top.visible {
+          opacity: 1;
+        transform: translateY(0);
+      }
+
+        /* ── Admin ── */
+        .admin-shell {
+          display: grid;
         gap: 1rem;
       }
 
-      .admin-grid {
-        display: grid;
+        .admin-grid {
+          display: grid;
         grid-template-columns: 260px 1fr;
         gap: 1rem;
       }
 
-      .admin-list {
-        border-right: 1px solid var(--line);
+        .admin-list {
+          border - right: 1px solid var(--line);
         padding-right: 0.9rem;
+        display: grid;
+        gap: 0.4rem;
+        align-content: start;
+      }
+
+        .admin-list ul {
+          list - style: none;
+        margin: 0;
+        padding: 0;
         display: grid;
         gap: 0.4rem;
       }
 
-      .admin-list ul {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-        display: grid;
-        gap: 0.45rem;
+        .settings-toggle {
+          display: none;
+        width: 100%;
+        background: transparent;
+        color: var(--muted);
+        border: 1px dashed var(--line);
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
       }
 
-      .post-item-btn {
-        width: 100%;
+        .settings-section {
+          display: grid;
+        gap: 0.4rem;
+      }
+
+        .post-item-btn {
+          width: 100%;
         text-align: left;
-        background: rgba(255, 255, 255, 0.65);
+        background: rgba(255, 255, 255, 0.55);
         color: var(--ink);
         border: 1px solid var(--line);
+        font-size: 0.88rem;
+        transition: all 0.15s;
       }
 
-      .post-item-btn.active {
-        border-color: var(--accent);
-        background: rgba(123, 80, 52, 0.12);
+        @media (prefers-color-scheme: dark) {
+        .post - item - btn {
+          background: rgba(255, 255, 255, 0.04);
+        }
       }
 
-      .admin-editor {
-        display: grid;
+        .post-item-btn:hover {
+          border - color: var(--accent);
+      }
+
+        .post-item-btn.active {
+          border - color: var(--accent);
+        background: var(--accent-glow);
+      }
+
+        .admin-editor {
+          display: grid;
         gap: 0.5rem;
       }
 
-      .row-actions {
-        display: flex;
+        /* ── Markdown Toolbar ── */
+        .md-toolbar {
+          display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        padding: 0.4rem;
+        background: var(--code-bg);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+        .md-toolbar button {
+          min - height: 36px;
+        min-width: 36px;
+        padding: 0.3rem 0.5rem;
+        font-family: var(--font-mono);
+        font-size: 0.78rem;
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid transparent;
+      }
+
+        .md-toolbar button:hover {
+          background: var(--accent-glow);
+        border-color: var(--line);
+        color: var(--ink);
+        transform: none;
+      }
+
+        .fullscreen-btn {
+          background: transparent !important;
+        color: var(--muted) !important;
+        border: 1px solid var(--line) !important;
+        font-family: var(--font-mono) !important;
+        font-size: 0.78rem !important;
+        min-height: 36px;
+      }
+
+        .row-actions {
+          display: flex;
         flex-wrap: wrap;
         gap: 0.5rem;
       }
 
-      .inline-check {
-        display: inline-flex;
+        .inline-check {
+          display: inline-flex;
         align-items: center;
         gap: 0.5rem;
         margin: 0.4rem 0;
       }
 
-      a {
-        color: var(--accent);
+        .inline-check input[type="checkbox"] {
+          width: 18px;
+        height: 18px;
+        accent-color: var(--accent);
       }
 
-      code {
-        font-family: "JetBrains Mono", Menlo, Consolas, monospace;
+        a {color: var(--accent); }
+
+        code {
+          font - family: var(--font-mono);
       }
 
-      @media (max-width: 860px) {
-        main {
-          margin-top: 1.2rem;
+        /* ── Fullscreen Editor Overlay ── */
+        .editor-fullscreen {
+          position: fixed;
+        inset: 0;
+        z-index: 9000;
+        background: var(--bg-1);
+        display: flex;
+        flex-direction: column;
+        padding: 0.8rem;
+        padding-top: env(safe-area-inset-top, 0.8rem);
+        padding-bottom: env(safe-area-inset-bottom, 0.8rem);
+      }
+
+        .editor-fullscreen textarea {
+          flex: 1;
+        border-radius: 8px;
+        font-size: 16px;
+        resize: none;
+      }
+
+        .editor-fullscreen .fs-actions {
+          display: flex;
+        gap: 0.5rem;
+        padding-top: 0.5rem;
+      }
+
+        .editor-fullscreen .fs-actions button {
+          flex: 1;
+      }
+
+        /* ── Responsive ── */
+        @media (max-width: 860px) {
+          main {
+          margin - top: 1rem;
+        width: 95vw;
         }
 
         .admin-grid {
-          grid-template-columns: 1fr;
+          grid - template - columns: 1fr;
         }
 
         .admin-list {
-          border-right: 0;
-          border-bottom: 1px solid var(--line);
-          padding-right: 0;
-          padding-bottom: 0.9rem;
+          border - right: 0;
+        border-bottom: 1px solid var(--line);
+        padding-right: 0;
+        padding-bottom: 0.9rem;
+        }
+
+        .settings-toggle {
+          display: flex;
+        }
+
+        .settings-section.collapsed {
+          display: none;
         }
 
         .site-header {
-          flex-direction: column;
-          align-items: stretch;
+          flex - direction: column;
+        align-items: stretch;
         }
 
         .community-grid {
-          grid-template-columns: 1fr;
+          grid - template - columns: 1fr;
         }
 
         .community-panel {
-          border-left: 0;
-          border-top: 1px solid var(--line);
-          padding-left: 0;
-          padding-top: 0.9rem;
+          border - left: 0;
+        border-top: 1px solid var(--line);
+        padding-left: 0;
+        padding-top: 0.9rem;
         }
 
         .article-wrap {
-          grid-template-columns: 1fr;
+          grid - template - columns: 1fr;
         }
 
         .article-side {
-          border-left: 0;
-          border-top: 1px solid var(--line);
-          padding-left: 0;
-          padding-top: 0.8rem;
+          border - left: 0;
+        border-top: 1px solid var(--line);
+        padding-left: 0;
+        padding-top: 0.8rem;
         }
 
-        input,
-        textarea,
-        button,
-        .link-button {
-          font-size: 16px;
+        input, textarea, button, .link-button {
+          font - size: 16px;
+        min-height: 44px;
         }
 
         textarea {
-          min-height: 54vh;
+          min - height: 60vh;
         }
 
         .admin-editor .row-actions {
           position: sticky;
-          bottom: 0;
-          background: rgba(255, 251, 244, 0.96);
-          padding: 0.45rem;
-          border: 1px solid var(--line);
-          border-radius: 10px;
+        bottom: 0;
+        background: var(--panel);
+        padding: 0.5rem;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        z-index: 10;
+        }
+
+        .back-top {
+          bottom: 4.5rem;
         }
       }
-    </style>
-  </head>
-  <body>
-    <main>
-      ${body}
-    </main>
-  </body>
-</html>`;
+
+        @media (max-width: 480px) {
+        .panel {
+          padding: 0.9rem;
+        border-radius: 12px;
+        }
+
+        h1 {
+          font - size: 1.3rem;
+        }
+      }
+      </style>
+    </head>
+    <body>
+      <main>
+        ${body}
+      </main>
+    </body>
+  </html>`;
 }
 
 function escapeHtml(value) {
@@ -2826,7 +3501,7 @@ function formatDate(value) {
 }
 
 function buildWelcomePost(slug, displayName, baseDomain) {
-  return `# Welcome to ${displayName}\n\n你已成功建立站點：\`${slug}.${baseDomain}\`。\n\n- 前台首頁：https://${slug}.${baseDomain}\n- 後台編輯：https://${slug}.${baseDomain}/admin\n\n現在你可以直接在後台開始寫作，體驗會偏向 Bear 的簡潔流。\n`;
+  return `# Welcome to ${displayName} \n\n你已成功建立站點：\`${slug}.${baseDomain}\`。\n\n- 前台首頁：https://${slug}.${baseDomain}\n- 後台編輯：https://${slug}.${baseDomain}/admin\n\n現在你可以直接在後台開始寫作，體驗會偏向 Bear 的簡潔流。\n`;
 }
 
 function renderMarkdown(source) {
