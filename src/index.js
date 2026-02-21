@@ -932,6 +932,53 @@ async function handleApi(request, env, ctx, context) {
     );
   }
 
+  if (request.method === "DELETE" && path.startsWith("/api/posts/")) {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const postSlug = decodeURIComponent(path.slice("/api/posts/".length)).toLowerCase();
+    if (!postSlug || postSlug.includes("/")) {
+      return json({ error: "Invalid post slug" }, 400);
+    }
+
+    const post = await getPostMeta(env, site.id, postSlug, true);
+    if (!post) {
+      return json({ error: "Post not found" }, 404);
+    }
+
+    try {
+      await githubDeleteFile(
+        env,
+        getPostFilePath(site.slug, post.postSlug),
+        `feat(${site.slug}): delete post ${post.postSlug}`
+      );
+      await deletePostMeta(env, site.id, post.postSlug);
+      await deleteCommentsByPost(env, site.id, post.postSlug);
+    } catch (error) {
+      console.error("Failed to delete post", error);
+      return json(
+        {
+          error: "Failed to delete post",
+          detail: String(error && error.message ? error.message : error),
+        },
+        502
+      );
+    }
+
+    return json({ ok: true, postSlug: post.postSlug }, 200);
+  }
+
   if (request.method === "POST" && path === "/api/posts") {
     if (!hostSlug) {
       return json({ error: "Missing site context" }, 400);
@@ -952,6 +999,10 @@ async function handleApi(request, env, ctx, context) {
     const title = sanitizeTitle(body.title || "");
     const requestedSlug = String(body.postSlug || "").trim().toLowerCase();
     const postSlug = requestedSlug || slugifyValue(title);
+    const previousSlugRaw = String(body.previousSlug || "").trim().toLowerCase();
+    const previousSlug = previousSlugRaw && !previousSlugRaw.includes("/")
+      ? previousSlugRaw
+      : "";
     const description = sanitizeDescription(body.description || "");
     const content = String(body.content || "");
     const published = Boolean(body.published) ? 1 : 0;
@@ -966,8 +1017,24 @@ async function handleApi(request, env, ctx, context) {
     }
 
     const now = new Date().toISOString();
+    const isRenaming = Boolean(previousSlug && previousSlug !== postSlug);
 
     try {
+      let existingPost = null;
+      let previousPost = null;
+
+      if (isRenaming) {
+        previousPost = await getPostMeta(env, site.id, previousSlug, true);
+        if (!previousPost) {
+          return json({ error: "Original post not found" }, 404);
+        }
+      }
+
+      existingPost = await getPostMeta(env, site.id, postSlug, true);
+      if (existingPost && isRenaming) {
+        return json({ error: "Target post slug already exists" }, 409);
+      }
+
       await githubWriteFile(
         env,
         getPostFilePath(site.slug, postSlug),
@@ -975,6 +1042,17 @@ async function handleApi(request, env, ctx, context) {
         `feat(${site.slug}): update post ${postSlug}`
       );
 
+      if (isRenaming) {
+        await githubDeleteFile(
+          env,
+          getPostFilePath(site.slug, previousSlug),
+          `feat(${site.slug}): rename post ${previousSlug} -> ${postSlug}`
+        );
+        await deletePostMeta(env, site.id, previousSlug);
+        await moveCommentsToPost(env, site.id, previousSlug, postSlug);
+      }
+
+      const createdAt = previousPost?.createdAt || existingPost?.createdAt || now;
       await upsertPostMeta(
         env,
         site.id,
@@ -983,7 +1061,7 @@ async function handleApi(request, env, ctx, context) {
         description,
         published,
         now,
-        now
+        createdAt
       );
     } catch (error) {
       console.error("Failed to save post", error);
@@ -1635,6 +1713,35 @@ async function upsertPostMeta(
     .run();
 }
 
+async function deletePostMeta(env, siteId, postSlug) {
+  const result = await env.DB.prepare(
+    "DELETE FROM posts WHERE site_id = ? AND post_slug = ?"
+  )
+    .bind(siteId, postSlug)
+    .run();
+  return Number(result.meta?.changes || 0) > 0;
+}
+
+async function deleteCommentsByPost(env, siteId, postSlug) {
+  await ensureCommentsTable(env);
+  await env.DB.prepare(
+    "DELETE FROM comments WHERE site_id = ? AND post_slug = ?"
+  )
+    .bind(siteId, postSlug)
+    .run();
+}
+
+async function moveCommentsToPost(env, siteId, fromPostSlug, toPostSlug) {
+  await ensureCommentsTable(env);
+  await env.DB.prepare(
+    `UPDATE comments
+     SET post_slug = ?
+     WHERE site_id = ? AND post_slug = ?`
+  )
+    .bind(toPostSlug, siteId, fromPostSlug)
+    .run();
+}
+
 function getGithubConfig(env) {
   const owner = String(env.GITHUB_OWNER || "").trim();
   const repo = String(env.GITHUB_REPO || "").trim();
@@ -1720,6 +1827,33 @@ async function githubWriteFile(env, filePath, content, message) {
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(`GitHub write failed: ${response.status} ${detail}`);
+  }
+
+  return response.json();
+}
+
+async function githubDeleteFile(env, filePath, message) {
+  const config = getGithubConfig(env);
+  const existing = await githubReadFile(env, filePath);
+  if (!existing || !existing.sha) {
+    return { deleted: false };
+  }
+  const encodedPath = encodeGitHubPath(filePath);
+  const response = await githubRequest(env, `/contents/${encodedPath}`, {
+    method: "DELETE",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      message,
+      branch: config.branch,
+      sha: existing.sha,
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`GitHub delete failed: ${response.status} ${detail}`);
   }
 
   return response.json();
@@ -2971,6 +3105,8 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
         <div class="admin-grid">
           <aside class="admin-list">
             <p class="muted">My Posts</p>
+            <input id="post-filter" placeholder="搜尋標題或 slug..." />
+            <p id="post-count" class="muted">0 篇</p>
             <ul id="post-list"></ul>
           </aside>
           <section class="admin-editor">
@@ -3001,6 +3137,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
             <div class="row-actions">
               <button id="save" type="button">發佈 / 更新</button>
               <a id="preview" class="link-button" href="#" target="_blank" rel="noreferrer noopener">預覽</a>
+              <button id="delete-post" type="button" class="link-button danger-ghost">刪除文章</button>
             </div>
             <p id="editor-status" class="muted"></p>
             <section class="comment-admin-panel">
@@ -3071,10 +3208,13 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
         currentSlug: '',
         posts: [],
         comments: [],
+        postFilter: '',
         siteConfig: initialConfig,
       };
 
       const postList = document.getElementById('post-list');
+      const postFilterInput = document.getElementById('post-filter');
+      const postCountEl = document.getElementById('post-count');
       const siteDisplayNameInput = document.getElementById('siteDisplayName');
       const siteDescriptionInput = document.getElementById('siteDescription');
       const siteHeroTitleInput = document.getElementById('siteHeroTitle');
@@ -3095,6 +3235,12 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const commentAdminListEl = document.getElementById('comment-admin-list');
       const commentAdminStatusEl = document.getElementById('comment-admin-status');
       const previewLink = document.getElementById('preview');
+      const deletePostBtn = document.getElementById('delete-post');
+      let savingPost = false;
+      let savingSettings = false;
+      let importingPosts = false;
+      let loadPostToken = 0;
+      let baselineState = '';
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
@@ -3181,6 +3327,24 @@ function draftKey(slug) {
   return 'stublogs-draft:' + location.host + ':' + id;
 }
 
+function getEditorSnapshot() {
+  return JSON.stringify({
+    title: titleInput.value,
+    postSlug: postSlugInput.value,
+    description: descriptionInput.value,
+    content: contentInput.value,
+    published: publishedInput.checked,
+  });
+}
+
+function markBaseline() {
+  baselineState = getEditorSnapshot();
+}
+
+function hasUnsavedChanges() {
+  return baselineState && baselineState !== getEditorSnapshot();
+}
+
 function saveDraft() {
   const key = draftKey(state.currentSlug);
   const payload = {
@@ -3245,17 +3409,39 @@ function resetEditor() {
   state.comments = [];
   renderCommentAdminList();
   setCommentAdminStatus('');
+  if (deletePostBtn) deletePostBtn.disabled = true;
   setStatus('New post');
+  markBaseline();
   tryRestoreDraft('');
 }
 
 function renderPostList() {
   if (!state.posts.length) {
     postList.innerHTML = '<li class="muted">No posts yet</li>';
+    if (postCountEl) postCountEl.textContent = '0 篇';
     return;
   }
 
-  postList.innerHTML = state.posts
+  const keyword = String(state.postFilter || '').trim().toLowerCase();
+  const filtered = keyword
+    ? state.posts.filter((post) => {
+      const text = (post.title + ' ' + post.postSlug).toLowerCase();
+      return text.includes(keyword);
+    })
+    : state.posts;
+
+  if (postCountEl) {
+    postCountEl.textContent = keyword
+      ? ('共 ' + state.posts.length + ' 篇，顯示 ' + filtered.length + ' 篇')
+      : (state.posts.length + ' 篇');
+  }
+
+  if (!filtered.length) {
+    postList.innerHTML = '<li class="muted">沒有符合搜尋的文章</li>';
+    return;
+  }
+
+  postList.innerHTML = filtered
     .map((post) => {
       const activeClass = post.postSlug === state.currentSlug ? 'active' : '';
       const stateLabel = Number(post.published) === 1 ? 'Published' : 'Draft';
@@ -3268,7 +3454,14 @@ function renderPostList() {
 
   Array.from(document.querySelectorAll('.post-item-btn')).forEach((button) => {
     button.addEventListener('click', () => {
-      loadPost(button.getAttribute('data-slug'));
+      const targetSlug = button.getAttribute('data-slug');
+      if (!targetSlug || targetSlug === state.currentSlug) {
+        return;
+      }
+      if (hasUnsavedChanges() && !confirm('目前有未儲存內容，確定切換文章？')) {
+        return;
+      }
+      loadPost(targetSlug);
     });
   });
 }
@@ -3351,11 +3544,17 @@ async function fetchJson(path, options) {
 async function refreshPosts() {
   const payload = await fetchJson('/api/list-posts?includeDrafts=1');
   state.posts = payload.posts || [];
+  if (state.currentSlug && !state.posts.some((post) => post.postSlug === state.currentSlug)) {
+    state.currentSlug = '';
+    if (deletePostBtn) deletePostBtn.disabled = true;
+  }
   renderPostList();
   if (!state.currentSlug && state.posts.length) {
     loadPost(state.posts[0].postSlug).catch((error) => {
       setStatus(error.message || 'Failed to load first post', true);
     });
+  } else if (!state.posts.length && deletePostBtn) {
+    deletePostBtn.disabled = true;
   }
 }
 
@@ -3370,8 +3569,12 @@ async function loadPost(slug) {
     return;
   }
 
+  const token = ++loadPostToken;
   try {
     const payload = await fetchJson('/api/posts/' + encodeURIComponent(slug));
+    if (token !== loadPostToken) {
+      return;
+    }
     const post = payload.post;
     state.currentSlug = post.postSlug;
     titleInput.value = post.title || '';
@@ -3379,17 +3582,23 @@ async function loadPost(slug) {
     descriptionInput.value = post.description || '';
     publishedInput.checked = Number(post.published) === 1;
     contentInput.value = post.content || '';
+    if (deletePostBtn) deletePostBtn.disabled = false;
     if (typeof updateSaveBtn === 'function') updateSaveBtn();
     renderPostList();
     tryRestoreDraft(post.postSlug);
+    markBaseline();
     await refreshCommentsForCurrentPost();
     setStatus('Loaded ' + post.postSlug);
   } catch (error) {
+    if (deletePostBtn) deletePostBtn.disabled = true;
     setStatus(error.message || 'Failed to load post', true);
   }
 }
 
 async function savePost() {
+  if (savingPost) {
+    return;
+  }
   const title = titleInput.value.trim();
   const postSlug = (postSlugInput.value.trim() || toSlug(title)).toLowerCase();
 
@@ -3404,6 +3613,7 @@ async function savePost() {
   }
 
   setStatus('Saving...');
+  savingPost = true;
   if (saveBtn) {
     saveBtn.disabled = true;
     saveBtn.textContent = '儲存中...';
@@ -3416,6 +3626,7 @@ async function savePost() {
       body: JSON.stringify({
         title,
         postSlug,
+        previousSlug: state.currentSlug || null,
         description: descriptionInput.value.trim(),
         content: contentInput.value,
         published: publishedInput.checked,
@@ -3432,10 +3643,12 @@ async function savePost() {
     } else {
       setStatus('已儲存草稿（前台不顯示）');
     }
+    markBaseline();
     saveDraft();
   } catch (error) {
     setStatus(error.message || 'Save failed', true);
   } finally {
+    savingPost = false;
     if (saveBtn) {
       saveBtn.disabled = false;
     }
@@ -3444,6 +3657,10 @@ async function savePost() {
 }
 
 async function saveSiteSettings() {
+  if (savingSettings) {
+    return;
+  }
+  savingSettings = true;
   setSettingsStatus('儲存設定中...');
   if (saveSettingsBtn) {
     saveSettingsBtn.disabled = true;
@@ -3478,6 +3695,7 @@ async function saveSiteSettings() {
   } catch (error) {
     setSettingsStatus(error.message || '儲存站點設定失敗', true);
   } finally {
+    savingSettings = false;
     if (saveSettingsBtn) {
       saveSettingsBtn.disabled = false;
       saveSettingsBtn.textContent = '儲存站點設定';
@@ -3485,7 +3703,12 @@ async function saveSiteSettings() {
   }
 }
 
-document.getElementById('new-post').addEventListener('click', resetEditor);
+document.getElementById('new-post').addEventListener('click', () => {
+  if (hasUnsavedChanges() && !confirm('目前有未儲存內容，確定建立新文章？')) {
+    return;
+  }
+  resetEditor();
+});
 document.getElementById('save').addEventListener('click', savePost);
 document.getElementById('save-settings').addEventListener('click', saveSiteSettings);
 document.getElementById('logout').addEventListener('click', async () => {
@@ -3517,6 +3740,46 @@ if (commentAdminListEl) {
   });
 }
 
+if (deletePostBtn) {
+  deletePostBtn.disabled = true;
+  deletePostBtn.addEventListener('click', async () => {
+    if (!state.currentSlug) {
+      setStatus('請先選擇文章', true);
+      return;
+    }
+    const slugToDelete = state.currentSlug;
+    const ok = confirm('確認刪除文章 ' + slugToDelete + '？此操作不可復原。');
+    if (!ok) {
+      return;
+    }
+
+    deletePostBtn.disabled = true;
+    setStatus('刪除中...');
+    try {
+      await fetchJson('/api/posts/' + encodeURIComponent(slugToDelete), { method: 'DELETE' });
+      const idx = state.posts.findIndex((post) => post.postSlug === slugToDelete);
+      state.posts = state.posts.filter((post) => post.postSlug !== slugToDelete);
+      renderPostList();
+      setStatus('已刪除：' + slugToDelete);
+      state.currentSlug = '';
+      state.comments = [];
+      renderCommentAdminList();
+
+      if (state.posts.length) {
+        const next = state.posts[Math.max(0, idx - 1)] || state.posts[0];
+        if (next && next.postSlug) {
+          await loadPost(next.postSlug);
+        }
+      } else {
+        resetEditor();
+      }
+    } catch (error) {
+      setStatus(error.message || '刪除失敗', true);
+      deletePostBtn.disabled = false;
+    }
+  });
+}
+
 titleInput.addEventListener('blur', () => {
   if (!postSlugInput.value.trim()) {
     postSlugInput.value = toSlug(titleInput.value);
@@ -3535,6 +3798,13 @@ if (previewLink) {
       event.preventDefault();
       setStatus('請先儲存文章後再預覽', true);
     }
+  });
+}
+
+if (postFilterInput) {
+  postFilterInput.addEventListener('input', () => {
+    state.postFilter = postFilterInput.value;
+    renderPostList();
   });
 }
 
@@ -3565,6 +3835,14 @@ document.addEventListener('keydown', (event) => {
       savePost();
     }
   }
+});
+
+window.addEventListener('beforeunload', (event) => {
+  if (!hasUnsavedChanges()) {
+    return;
+  }
+  event.preventDefault();
+  event.returnValue = '';
 });
 
 applySettingsToForm(initialConfig);
@@ -3678,20 +3956,29 @@ const importFile = document.getElementById('import-file');
 const importStatus = document.getElementById('import-status');
 if (importBtn && importFile) {
   importBtn.addEventListener('click', async () => {
+    if (importingPosts) {
+      return;
+    }
     const file = importFile.files[0];
     if (!file) {
       importStatus.textContent = 'Please select a CSV file';
       return;
     }
+    importingPosts = true;
     importStatus.textContent = 'Importing...';
     importBtn.disabled = true;
     try {
       const fd = new FormData();
       fd.append('file', file);
       const res = await fetch('/api/import', { method: 'POST', body: fd });
-      const data = await res.json();
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
       if (!res.ok) {
-        importStatus.textContent = data.error || 'Import failed';
+        importStatus.textContent = (data && data.error) || 'Import failed';
         importStatus.style.color = 'var(--accent)';
         return;
       }
@@ -3701,6 +3988,7 @@ if (importBtn && importFile) {
     } catch (e) {
       importStatus.textContent = e.message || 'Import failed';
     } finally {
+      importingPosts = false;
       importBtn.disabled = false;
     }
   });
@@ -3887,8 +4175,10 @@ button:active,.link-button:active{transform:translateY(0)}
 .admin-tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
 .admin-panel{margin-top:1rem}
 .admin-grid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:1.5rem}
-.admin-list{border-right:1px solid var(--line);padding-right:1rem;display:grid;gap:.5rem;align-content:start}
-.admin-list ul{list-style:none;margin:0;padding:0;display:grid;gap:.4rem}
+.admin-list{border-right:1px solid var(--line);padding-right:1rem;display:grid;gap:.5rem;align-content:start;min-width:0}
+.admin-list ul{list-style:none;margin:0;padding:0;display:grid;gap:.4rem;max-height:min(72vh,780px);overflow:auto;padding-right:.25rem}
+.danger-ghost{background:transparent;color:var(--muted);border-color:var(--line)}
+.danger-ghost:hover{color:#b7462c;border-color:#b7462c;transform:none}
 .settings-grid{display:grid;grid-template-columns:1fr 280px;gap:2rem}
 .settings-grid > *{min-width:0}
 .settings-form{display:grid;gap:.5rem;align-content:start}
@@ -3921,6 +4211,7 @@ code{font-family:var(--font-mono)}
   main{margin-top:1rem;width:95vw}
   .admin-grid{grid-template-columns:1fr}
   .admin-list{border-right:0;border-bottom:1px solid var(--line);padding-right:0;padding-bottom:.9rem}
+  .admin-list ul{max-height:none}
   .settings-grid{grid-template-columns:1fr}
   .settings-aside{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:1rem}
   .site-header{flex-direction:column;align-items:stretch}
