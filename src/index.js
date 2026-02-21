@@ -25,10 +25,16 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
 const DEFAULT_API_ENTRY_SLUG = "app";
 const SITE_CONFIG_VERSION = 2;
 const LEGACY_FOOTER_NOTE = "在這裡，把語文寫成你自己。";
+const POSTS_PAGE_SIZE = 10;
+const COMMENTS_PAGE_SIZE = 20;
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
 const loginAttempts = new Map();
+const COMMENT_RATE_WINDOW_MS = 60 * 1000;
+const COMMENT_RATE_MAX_ATTEMPTS = 6;
+const commentAttempts = new Map();
+let commentsTableReadyPromise = null;
 
 export default {
   async fetch(request, env, ctx) {
@@ -220,12 +226,65 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (path === "/") {
-    const posts = await listPosts(env, site.id, false);
     const siteConfig = await getSiteConfig(env, site);
+    const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
+    const postsPage = await listPostsPage(env, site.id, page, POSTS_PAGE_SIZE);
     const communitySites = await listCommunitySites(env, site.slug, 12);
     const campusFeed = await listCampusFeed(env, site.id, 18);
     return html(
-      renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed, baseDomain),
+      renderSiteHomePage(
+        site,
+        siteConfig,
+        postsPage.posts,
+        communitySites,
+        campusFeed,
+        baseDomain,
+        postsPage
+      ),
+      200
+    );
+  }
+
+  if (path.startsWith("/preview/")) {
+    const previewSlug = path.slice("/preview/".length).toLowerCase();
+    if (!previewSlug || previewSlug.includes("/")) {
+      return notFound("Preview not found");
+    }
+
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return html(renderSimpleMessage("401", "Preview requires login"), 401);
+    }
+
+    const post = await getPostMeta(env, site.id, previewSlug, true);
+    if (!post) {
+      return notFound("Preview not found");
+    }
+
+    const file = await githubReadFile(env, getPostFilePath(site.slug, post.postSlug));
+    if (!file) {
+      return notFound("Post content missing");
+    }
+
+    const siteConfig = await getSiteConfig(env, site);
+    const communitySites = !siteConfig.hideCommunitySites
+      ? await listCommunitySites(env, site.slug, 8)
+      : [];
+    const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
+    const commentsData = siteConfig.commentsEnabled
+      ? await listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
+      : { comments: [], page: 1, totalPages: 1, total: 0 };
+    const articleHtml = renderMarkdown(file.content);
+    return html(
+      renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, {
+        previewMode: true,
+        comments: commentsData.comments,
+        commentsPage: commentsData.page,
+        commentsTotalPages: commentsData.totalPages,
+        commentsEnabled: siteConfig.commentsEnabled,
+        commentsTotal: commentsData.total,
+        commentBasePath: `/preview/${encodeURIComponent(post.postSlug)}`,
+      }),
       200
     );
   }
@@ -251,9 +310,25 @@ async function handleRequest(request, env, ctx) {
   }
 
   const siteConfig = await getSiteConfig(env, site);
-  const communitySites = await listCommunitySites(env, site.slug, 8);
+  const communitySites = !siteConfig.hideCommunitySites
+    ? await listCommunitySites(env, site.slug, 8)
+    : [];
+  const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
+  const commentsData = siteConfig.commentsEnabled
+    ? await listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
+    : { comments: [], page: 1, totalPages: 1, total: 0 };
   const articleHtml = renderMarkdown(file.content);
-  return html(renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain), 200);
+  return html(
+    renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, {
+      comments: commentsData.comments,
+      commentsPage: commentsData.page,
+      commentsTotalPages: commentsData.totalPages,
+      commentsEnabled: siteConfig.commentsEnabled,
+      commentsTotal: commentsData.total,
+      commentBasePath: `/${encodeURIComponent(post.postSlug)}`,
+    }),
+    200
+  );
 }
 
 async function handleApi(request, env, ctx, context) {
@@ -369,6 +444,7 @@ async function handleApi(request, env, ctx, context) {
             headerLinks: [],
             hideCommunitySites: false,
             hideCampusFeed: false,
+            commentsEnabled: true,
             createdAt: now,
             updatedAt: now,
             exportVersion: SITE_CONFIG_VERSION,
@@ -519,6 +595,9 @@ async function handleApi(request, env, ctx, context) {
     const hideCampusFeed = body.hideCampusFeed === undefined
       ? Boolean(currentConfig.hideCampusFeed)
       : Boolean(body.hideCampusFeed);
+    const commentsEnabled = body.commentsEnabled === undefined
+      ? Boolean(currentConfig.commentsEnabled)
+      : Boolean(body.commentsEnabled);
 
     const nextConfig = normalizeSiteConfig(
       {
@@ -532,6 +611,7 @@ async function handleApi(request, env, ctx, context) {
         headerLinks,
         hideCommunitySites,
         hideCampusFeed,
+        commentsEnabled,
         createdAt: site.createdAt,
         updatedAt: now,
       },
@@ -659,6 +739,160 @@ async function handleApi(request, env, ctx, context) {
       },
       200
     );
+  }
+
+  if (request.method === "GET" && path === "/api/admin/comments") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    await ensureCommentsTable(env);
+    const postSlug = String(url.searchParams.get("postSlug") || "").trim().toLowerCase();
+    const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
+    const pageSize = COMMENTS_PAGE_SIZE;
+
+    if (postSlug) {
+      const commentsData = await listPostComments(env, site.id, postSlug, page, pageSize);
+      return json(
+        {
+          postSlug,
+          comments: commentsData.comments,
+          page: commentsData.page,
+          totalPages: commentsData.totalPages,
+          total: commentsData.total,
+        },
+        200
+      );
+    }
+
+    const commentsData = await listSiteComments(env, site.id, page, pageSize);
+    return json(
+      {
+        comments: commentsData.comments,
+        page: commentsData.page,
+        totalPages: commentsData.totalPages,
+        total: commentsData.total,
+      },
+      200
+    );
+  }
+
+  if (request.method === "GET" && path === "/api/comments") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const postSlug = String(url.searchParams.get("postSlug") || "").trim().toLowerCase();
+    if (!postSlug) {
+      return json({ error: "Missing post slug" }, 400);
+    }
+
+    const post = await getPostMeta(env, site.id, postSlug, false);
+    if (!post) {
+      return json({ error: "Post not found" }, 404);
+    }
+
+    const siteConfig = await getSiteConfig(env, site);
+    if (!siteConfig.commentsEnabled) {
+      return json({ comments: [], page: 1, totalPages: 1, total: 0 }, 200);
+    }
+
+    const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
+    const commentsData = await listPostComments(env, site.id, postSlug, page, COMMENTS_PAGE_SIZE);
+    return json(
+      {
+        comments: commentsData.comments,
+        page: commentsData.page,
+        totalPages: commentsData.totalPages,
+        total: commentsData.total,
+      },
+      200
+    );
+  }
+
+  if (request.method === "POST" && path === "/api/comments") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+
+    const siteConfig = await getSiteConfig(env, site);
+    if (!siteConfig.commentsEnabled) {
+      return json({ error: "Comments are disabled for this site" }, 403);
+    }
+
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const rateKey = `${clientIp}:${site.slug}:comments`;
+    const nowTs = Date.now();
+    const attempts = commentAttempts.get(rateKey) || [];
+    const recent = attempts.filter((t) => nowTs - t < COMMENT_RATE_WINDOW_MS);
+    if (recent.length >= COMMENT_RATE_MAX_ATTEMPTS) {
+      return json({ error: "Too many comments, please try later" }, 429);
+    }
+
+    const body = await readJson(request);
+    const postSlug = String(body.postSlug || "").trim().toLowerCase();
+    const authorName = sanitizeCommentAuthor(body.authorName || "");
+    const authorSite = sanitizeOptionalSiteSlug(body.authorSiteSlug || "");
+    const content = sanitizeCommentContent(body.content || "");
+    if (!postSlug) {
+      return json({ error: "Missing post slug" }, 400);
+    }
+    if (!authorName) {
+      return json({ error: "Name is required" }, 400);
+    }
+    if (!content) {
+      return json({ error: "Comment content is required" }, 400);
+    }
+
+    const post = await getPostMeta(env, site.id, postSlug, false);
+    if (!post) {
+      return json({ error: "Post not found" }, 404);
+    }
+
+    recent.push(nowTs);
+    commentAttempts.set(rateKey, recent);
+    const created = await createComment(env, site.id, postSlug, authorName, authorSite, content);
+    return json({ ok: true, comment: created }, 201);
+  }
+
+  if (request.method === "DELETE" && path.startsWith("/api/comments/")) {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const rawId = path.slice("/api/comments/".length);
+    const id = Number(rawId);
+    if (!Number.isInteger(id) || id <= 0) {
+      return json({ error: "Invalid comment id" }, 400);
+    }
+    const deleted = await deleteComment(env, site.id, id);
+    if (!deleted) {
+      return json({ error: "Comment not found" }, 404);
+    }
+    return json({ ok: true }, 200);
   }
 
   if (request.method === "GET" && path.startsWith("/api/posts/")) {
@@ -1103,6 +1337,55 @@ async function listCampusFeed(env, excludeSiteId = null, limit = 24) {
   }));
 }
 
+async function listPostsPage(env, siteId, page = 1, pageSize = POSTS_PAGE_SIZE) {
+  const safePageSize = Math.min(Math.max(Number(pageSize) || POSTS_PAGE_SIZE, 1), 60);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const offset = (safePage - 1) * safePageSize;
+
+  const [rowsResult, totalResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        post_slug AS postSlug,
+        title,
+        description,
+        published,
+        created_at AS createdAt,
+        updated_at AS updatedAt
+      FROM posts
+      WHERE site_id = ? AND published = 1
+      ORDER BY updated_at DESC
+      LIMIT ? OFFSET ?`
+    )
+      .bind(siteId, safePageSize, offset)
+      .all(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS total
+      FROM posts
+      WHERE site_id = ? AND published = 1`
+    )
+      .bind(siteId)
+      .first(),
+  ]);
+
+  const total = Number(totalResult?.total || 0);
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const boundedPage = Math.min(safePage, totalPages);
+
+  if (boundedPage !== safePage) {
+    return listPostsPage(env, siteId, boundedPage, safePageSize);
+  }
+
+  return {
+    posts: rowsResult.results || [],
+    total,
+    page: boundedPage,
+    pageSize: safePageSize,
+    totalPages,
+    hasPrev: boundedPage > 1,
+    hasNext: boundedPage < totalPages,
+  };
+}
+
 async function listPosts(env, siteId, includeDrafts = false) {
   const sql = includeDrafts
     ? `SELECT
@@ -1128,6 +1411,176 @@ async function listPosts(env, siteId, includeDrafts = false) {
 
   const result = await env.DB.prepare(sql).bind(siteId).all();
   return result.results || [];
+}
+
+async function ensureCommentsTable(env) {
+  if (!commentsTableReadyPromise) {
+    commentsTableReadyPromise = (async () => {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS comments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          site_id INTEGER NOT NULL,
+          post_slug TEXT NOT NULL,
+          author_name TEXT NOT NULL,
+          author_site_slug TEXT NOT NULL DEFAULT '',
+          content TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_comments_site_post_created
+         ON comments(site_id, post_slug, created_at DESC)`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_comments_site_created
+         ON comments(site_id, created_at DESC)`
+      ).run();
+    })().catch((error) => {
+      commentsTableReadyPromise = null;
+      throw error;
+    });
+  }
+  return commentsTableReadyPromise;
+}
+
+async function listPostComments(env, siteId, postSlug, page = 1, pageSize = COMMENTS_PAGE_SIZE) {
+  await ensureCommentsTable(env);
+  const safePageSize = Math.min(Math.max(Number(pageSize) || COMMENTS_PAGE_SIZE, 1), 80);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const offset = (safePage - 1) * safePageSize;
+
+  const [rowsResult, totalResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        id,
+        post_slug AS postSlug,
+        author_name AS authorName,
+        author_site_slug AS authorSiteSlug,
+        content,
+        created_at AS createdAt
+      FROM comments
+      WHERE site_id = ? AND post_slug = ?
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?`
+    )
+      .bind(siteId, postSlug, safePageSize, offset)
+      .all(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS total
+       FROM comments
+       WHERE site_id = ? AND post_slug = ?`
+    )
+      .bind(siteId, postSlug)
+      .first(),
+  ]);
+
+  const total = Number(totalResult?.total || 0);
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const boundedPage = Math.min(safePage, totalPages);
+  if (boundedPage !== safePage) {
+    return listPostComments(env, siteId, postSlug, boundedPage, safePageSize);
+  }
+
+  const comments = (rowsResult.results || []).map((item) => ({
+    id: Number(item.id),
+    postSlug: item.postSlug,
+    authorName: item.authorName,
+    authorSiteSlug: item.authorSiteSlug || "",
+    content: item.content,
+    createdAt: item.createdAt,
+  }));
+
+  return {
+    comments,
+    total,
+    page: boundedPage,
+    totalPages,
+    pageSize: safePageSize,
+  };
+}
+
+async function listSiteComments(env, siteId, page = 1, pageSize = COMMENTS_PAGE_SIZE) {
+  await ensureCommentsTable(env);
+  const safePageSize = Math.min(Math.max(Number(pageSize) || COMMENTS_PAGE_SIZE, 1), 80);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const offset = (safePage - 1) * safePageSize;
+
+  const [rowsResult, totalResult] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        id,
+        post_slug AS postSlug,
+        author_name AS authorName,
+        author_site_slug AS authorSiteSlug,
+        content,
+        created_at AS createdAt
+      FROM comments
+      WHERE site_id = ?
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?`
+    )
+      .bind(siteId, safePageSize, offset)
+      .all(),
+    env.DB.prepare("SELECT COUNT(*) AS total FROM comments WHERE site_id = ?")
+      .bind(siteId)
+      .first(),
+  ]);
+
+  const total = Number(totalResult?.total || 0);
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const boundedPage = Math.min(safePage, totalPages);
+  if (boundedPage !== safePage) {
+    return listSiteComments(env, siteId, boundedPage, safePageSize);
+  }
+
+  const comments = (rowsResult.results || []).map((item) => ({
+    id: Number(item.id),
+    postSlug: item.postSlug,
+    authorName: item.authorName,
+    authorSiteSlug: item.authorSiteSlug || "",
+    content: item.content,
+    createdAt: item.createdAt,
+  }));
+
+  return {
+    comments,
+    total,
+    page: boundedPage,
+    totalPages,
+    pageSize: safePageSize,
+  };
+}
+
+async function createComment(env, siteId, postSlug, authorName, authorSiteSlug, content) {
+  await ensureCommentsTable(env);
+  const createdAt = new Date().toISOString();
+  const result = await env.DB.prepare(
+    `INSERT INTO comments (site_id, post_slug, author_name, author_site_slug, content, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(siteId, postSlug, authorName, authorSiteSlug, content, createdAt)
+    .run();
+
+  const id = Number(result.meta?.last_row_id || 0);
+  return {
+    id,
+    postSlug,
+    authorName,
+    authorSiteSlug,
+    content,
+    createdAt,
+  };
+}
+
+async function deleteComment(env, siteId, commentId) {
+  await ensureCommentsTable(env);
+  const result = await env.DB.prepare(
+    "DELETE FROM comments WHERE id = ? AND site_id = ?"
+  )
+    .bind(commentId, siteId)
+    .run();
+  return Number(result.meta?.changes || 0) > 0;
 }
 
 async function getPostMeta(env, siteId, postSlug, includeDrafts = false) {
@@ -1301,6 +1754,7 @@ function defaultSiteConfigFromSite(site) {
       headerLinks: [],
       hideCommunitySites: false,
       hideCampusFeed: false,
+      commentsEnabled: true,
       createdAt: site.createdAt || new Date().toISOString(),
       updatedAt: site.updatedAt || new Date().toISOString(),
       exportVersion: SITE_CONFIG_VERSION,
@@ -1383,6 +1837,7 @@ function normalizeSiteConfig(rawConfig, site) {
       headerLinks: [],
       hideCommunitySites: false,
       hideCampusFeed: false,
+      commentsEnabled: true,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       exportVersion: SITE_CONFIG_VERSION,
@@ -1405,6 +1860,7 @@ function normalizeSiteConfig(rawConfig, site) {
     headerLinks: sanitizeHeaderLinks(Array.isArray(merged.headerLinks) ? merged.headerLinks : []),
     hideCommunitySites: Boolean(merged.hideCommunitySites),
     hideCampusFeed: Boolean(merged.hideCampusFeed),
+    commentsEnabled: merged.commentsEnabled === undefined ? true : Boolean(merged.commentsEnabled),
     createdAt: String(merged.createdAt || base.createdAt),
     updatedAt: String(merged.updatedAt || new Date().toISOString()),
     exportVersion: SITE_CONFIG_VERSION,
@@ -1423,6 +1879,7 @@ function defaultSiteConfigFromSiteBase(site) {
     headerLinks: [],
     hideCommunitySites: false,
     hideCampusFeed: false,
+    commentsEnabled: true,
     createdAt: site.createdAt || new Date().toISOString(),
     updatedAt: site.updatedAt || new Date().toISOString(),
     exportVersion: SITE_CONFIG_VERSION,
@@ -1639,7 +2096,7 @@ function withCors(response, request, env) {
 
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", allowedOrigin);
-  headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
   headers.set("Vary", "Origin");
 
@@ -1659,7 +2116,7 @@ function buildApiPreflightResponse(request, env) {
     status: 204,
     headers: {
       "Access-Control-Allow-Origin": allowedOrigin,
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
       "Access-Control-Max-Age": "86400",
       Vary: "Origin",
@@ -1758,6 +2215,17 @@ function normalizePath(pathname) {
     return path.slice(0, -1);
   }
   return path;
+}
+
+function parsePositiveInt(value, fallback = 1, min = 1, max = 9999) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed) || parsed < min) {
+    return fallback;
+  }
+  if (parsed > max) {
+    return max;
+  }
+  return parsed;
 }
 
 function parseCSV(text) {
@@ -1861,6 +2329,36 @@ function sanitizeDescription(value) {
   return String(value || "")
     .trim()
     .slice(0, 240);
+}
+
+function sanitizeCommentAuthor(value) {
+  return sanitizeName(value)
+    .replace(/\s+/g, " ")
+    .slice(0, 40);
+}
+
+function sanitizeCommentContent(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .slice(0, 2000);
+}
+
+function sanitizeOptionalSiteSlug(value) {
+  const slug = String(value || "").trim().toLowerCase();
+  if (!slug) {
+    return "";
+  }
+  if (slug.length < 2 || slug.length > 30) {
+    return "";
+  }
+  if (!/^[a-z0-9-]+$/.test(slug)) {
+    return "";
+  }
+  if (slug.startsWith("-") || slug.endsWith("-") || slug.includes("--")) {
+    return "";
+  }
+  return slug;
 }
 
 function json(data, status = 200, extraHeaders = {}) {
@@ -2105,7 +2603,15 @@ function renderRootAdminHelp(baseDomain) {
   );
 }
 
-function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed, baseDomain) {
+function renderSiteHomePage(
+  site,
+  siteConfig,
+  posts,
+  communitySites,
+  campusFeed,
+  baseDomain,
+  postsPage = null
+) {
   const heading = siteConfig.heroTitle || site.displayName;
   const subtitle = siteConfig.heroSubtitle || site.description || "";
 
@@ -2134,7 +2640,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
       .join("\n")
     : `<li class="post-item muted">還沒有已發佈文章。</li>`;
 
-  const peerSites = (!siteConfig.hideCommunitySites && communitySites.length)
+  const peerSites = communitySites.length
     ? communitySites
       .map(
         (peer) =>
@@ -2145,7 +2651,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
       .join("")
     : `<li class="muted">暫時沒有其他同學站點。</li>`;
 
-  const feedItems = (!siteConfig.hideCampusFeed && campusFeed.length)
+  const feedItems = campusFeed.length
     ? campusFeed
       .map(
         (entry) =>
@@ -2155,6 +2661,14 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
       )
       .join("")
     : `<li class="muted">全校文章流暫時為空。</li>`;
+
+  const pagination = postsPage && postsPage.totalPages > 1
+    ? `<nav class="pager" aria-label="文章分頁">
+        <a class="${postsPage.hasPrev ? "" : "disabled"}" href="${postsPage.hasPrev ? (postsPage.page - 1 <= 1 ? "/" : `/?page=${postsPage.page - 1}`) : "#"}">上一頁</a>
+        <span class="muted">第 ${postsPage.page} / ${postsPage.totalPages} 頁</span>
+        <a class="${postsPage.hasNext ? "" : "disabled"}" href="${postsPage.hasNext ? `/?page=${postsPage.page + 1}` : "#"}">下一頁</a>
+      </nav>`
+    : "";
 
   return renderLayout(
     site.displayName,
@@ -2170,6 +2684,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
           <a class="link-button" href="/admin">Admin</a>
         </div>
       </header>
+      ${renderThemeControlDock("front")}
       ${navLinks}
 
       <div class="community-grid">
@@ -2178,6 +2693,7 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
           <ul class="post-list">
             ${list}
           </ul>
+          ${pagination}
         </section>
         ${(!siteConfig.hideCommunitySites || !siteConfig.hideCampusFeed) ? `
         <aside class="community-panel">
@@ -2195,7 +2711,18 @@ function renderSiteHomePage(site, siteConfig, posts, communitySites, campusFeed,
   );
 }
 
-function renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain) {
+function renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, options = {}) {
+  const previewMode = Boolean(options.previewMode);
+  const commentsEnabled = options.commentsEnabled !== false;
+  const comments = Array.isArray(options.comments) ? options.comments : [];
+  const commentsPage = Math.max(Number(options.commentsPage) || 1, 1);
+  const commentsTotalPages = Math.max(Number(options.commentsTotalPages) || 1, 1);
+  const commentBasePath = String(
+    options.commentBasePath || `/${encodeURIComponent(post.postSlug)}`
+  );
+  const commentsTotal = Number(options.commentsTotal || comments.length || 0);
+  const showCommunityPanel = !siteConfig.hideCommunitySites;
+
   const peerSites = communitySites.length
     ? communitySites
       .map(
@@ -2206,6 +2733,28 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
       )
       .join("")
     : `<li class="muted">暫時沒有其他同學站點。</li>`;
+
+  const commentsList = comments.length
+    ? comments
+      .map((item) => {
+        const author = item.authorSiteSlug
+          ? `<a href="https://${escapeHtml(item.authorSiteSlug)}.${escapeHtml(baseDomain)}" target="_blank" rel="noreferrer noopener">${escapeHtml(item.authorName)}</a>`
+          : escapeHtml(item.authorName);
+        return `<li class="comment-item">
+          <p class="comment-meta">${author} · ${escapeHtml(formatDate(item.createdAt))}</p>
+          <p class="comment-content">${escapeHtml(item.content).replace(/\n/g, "<br />")}</p>
+        </li>`;
+      })
+      .join("")
+    : `<li class="comment-item muted">目前還沒有留言。</li>`;
+
+  const commentPager = commentsTotalPages > 1
+    ? `<nav class="pager comments-pager" aria-label="留言分頁">
+        <a class="${commentsPage > 1 ? "" : "disabled"}" href="${commentsPage > 1 ? `${commentBasePath}?cpage=${commentsPage - 1}#comments` : "#"}">上一頁</a>
+        <span class="muted">留言 ${commentsPage} / ${commentsTotalPages}</span>
+        <a class="${commentsPage < commentsTotalPages ? "" : "disabled"}" href="${commentsPage < commentsTotalPages ? `${commentBasePath}?cpage=${commentsPage + 1}#comments` : "#"}">下一頁</a>
+      </nav>`
+    : "";
 
   // Estimate read time (~400 chars/min for Chinese)
   const charCount = articleHtml.replace(/<[^>]+>/g, "").length;
@@ -2219,16 +2768,36 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
       <article class="article">
         <p class="eyebrow"><a href="/">← ${escapeHtml(site.displayName)}</a> · ${escapeHtml(
       site.slug
-    )}.${escapeHtml(baseDomain)}</p>
+    )}.${escapeHtml(baseDomain)} ${previewMode ? '<span class="preview-badge">Preview</span>' : ''}</p>
         <h1>${escapeHtml(post.title)}</h1>
         <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span></p>
+        ${renderThemeControlDock("front")}
         <div class="article-body">${articleHtml}</div>
       </article>
+      ${showCommunityPanel ? `
       <aside class="article-side">
         <h3>同學站點</h3>
         <ul class="mini-list">${peerSites}</ul>
       </aside>
+      ` : ''}
     </section>
+    ${commentsEnabled ? `
+    <section id="comments" class="panel wide comment-panel">
+      <h2>留言 (${commentsTotal})</h2>
+      <ul class="comment-list">${commentsList}</ul>
+      ${commentPager}
+      <form id="comment-form" class="stack" autocomplete="off">
+        <label>名稱</label>
+        <input id="comment-author" maxlength="40" required placeholder="你的名字" />
+        <label>你的站點 slug（可選）</label>
+        <input id="comment-site" maxlength="30" placeholder="alice" />
+        <label>留言內容</label>
+        <textarea id="comment-content" class="small-textarea" maxlength="2000" required placeholder="寫下你的留言"></textarea>
+        <button id="comment-submit" type="submit">送出留言</button>
+      </form>
+      <p id="comment-status" class="muted"></p>
+    </section>
+    ` : ""}
     <button class="back-top" id="back-top" aria-label="Back to top">↑</button>
     <script>
       (function() {
@@ -2250,9 +2819,70 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
             window.scrollTo({ top: 0, behavior: 'smooth' });
           });
         }
+
+        const form = document.getElementById('comment-form');
+        const statusEl = document.getElementById('comment-status');
+        if (form && statusEl) {
+          const authorInput = document.getElementById('comment-author');
+          const siteInput = document.getElementById('comment-site');
+          const contentInput = document.getElementById('comment-content');
+          const submitBtn = document.getElementById('comment-submit');
+          const storageKey = 'stublogs-comment-profile:' + location.host;
+
+          try {
+            const profile = JSON.parse(localStorage.getItem(storageKey) || '{}');
+            if (profile.authorName) authorInput.value = profile.authorName;
+            if (profile.authorSiteSlug) siteInput.value = profile.authorSiteSlug;
+          } catch {}
+
+          function setCommentStatus(message, isError) {
+            statusEl.textContent = message;
+            statusEl.style.color = isError ? '#ae3a22' : 'var(--muted)';
+          }
+
+          form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const payload = {
+              postSlug: ${JSON.stringify(post.postSlug)},
+              authorName: authorInput.value.trim(),
+              authorSiteSlug: siteInput.value.trim().toLowerCase(),
+              content: contentInput.value.trim(),
+            };
+            if (!payload.authorName || !payload.content) {
+              setCommentStatus('請填寫名稱與留言內容', true);
+              return;
+            }
+
+            submitBtn.disabled = true;
+            setCommentStatus('送出中...', false);
+            try {
+              const response = await fetch('/api/comments', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+              const data = await response.json();
+              if (!response.ok) {
+                setCommentStatus(data.error || '留言送出失敗', true);
+                return;
+              }
+              localStorage.setItem(storageKey, JSON.stringify({
+                authorName: payload.authorName,
+                authorSiteSlug: payload.authorSiteSlug,
+              }));
+              setCommentStatus('留言成功，正在更新列表...', false);
+              location.href = ${JSON.stringify(commentBasePath)} + '#comments';
+            } catch (error) {
+              setCommentStatus(error.message || '留言送出失敗', true);
+            } finally {
+              submitBtn.disabled = false;
+            }
+          });
+        }
       })();
     </script>
-  `, siteConfig.colorTheme || 'default'
+  `,
+    siteConfig.colorTheme || "default"
   );
 }
 
@@ -2327,6 +2957,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
           <button id="new-post" class="link-button" type="button">New</button>
           <button id="logout" class="link-button" type="button">Logout</button>
           <a class="link-button" href="/api/export">Export</a>
+          <a class="link-button" href="https://blog.bdfz.net/" target="_blank" rel="noreferrer noopener">Project</a>
         </div>
       </header>
 
@@ -2372,6 +3003,11 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
               <a id="preview" class="link-button" href="#" target="_blank" rel="noreferrer noopener">預覽</a>
             </div>
             <p id="editor-status" class="muted"></p>
+            <section class="comment-admin-panel">
+              <h3>留言管理（目前文章）</h3>
+              <ul id="comment-admin-list" class="comment-list compact"></ul>
+              <p id="comment-admin-status" class="muted"></p>
+            </section>
           </section>
         </div>
       </div>
@@ -2411,6 +3047,10 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
               <input id="siteHideCampusFeed" type="checkbox" />
               隱藏「全校最新文章」板塊
             </label>
+            <label class="inline-check">
+              <input id="siteCommentsEnabled" type="checkbox" />
+              啟用文章留言
+            </label>
             <button id="save-settings" type="button">儲存站點設定</button>
             <p id="settings-status" class="muted"></p>
           </section>
@@ -2429,8 +3069,9 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const initialConfig = ${toScriptJson(siteConfig)};
       const state = {
         currentSlug: '',
-      posts: [],
-      siteConfig: initialConfig,
+        posts: [],
+        comments: [],
+        siteConfig: initialConfig,
       };
 
       const postList = document.getElementById('post-list');
@@ -2443,6 +3084,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const siteHeaderLinksInput = document.getElementById('siteHeaderLinks');
       const siteHideCommunitySitesInput = document.getElementById('siteHideCommunitySites');
       const siteHideCampusFeedInput = document.getElementById('siteHideCampusFeed');
+      const siteCommentsEnabledInput = document.getElementById('siteCommentsEnabled');
       const titleInput = document.getElementById('title');
       const postSlugInput = document.getElementById('postSlug');
       const descriptionInput = document.getElementById('description');
@@ -2450,6 +3092,8 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const contentInput = document.getElementById('content');
       const statusEl = document.getElementById('editor-status');
       const settingsStatusEl = document.getElementById('settings-status');
+      const commentAdminListEl = document.getElementById('comment-admin-list');
+      const commentAdminStatusEl = document.getElementById('comment-admin-status');
       const previewLink = document.getElementById('preview');
 
       function setStatus(message, isError = false) {
@@ -2529,6 +3173,7 @@ function applySettingsToForm(config) {
   siteHeaderLinksInput.value = renderHeaderLinksValue(safe.headerLinks || []);
   if (siteHideCommunitySitesInput) siteHideCommunitySitesInput.checked = !!safe.hideCommunitySites;
   if (siteHideCampusFeedInput) siteHideCampusFeedInput.checked = !!safe.hideCampusFeed;
+  if (siteCommentsEnabledInput) siteCommentsEnabledInput.checked = safe.commentsEnabled !== false;
 }
 
 function draftKey(slug) {
@@ -2582,7 +3227,9 @@ function tryRestoreDraft(slug) {
 function syncPreview() {
   const slug = postSlugInput.value.trim().toLowerCase();
   if (previewLink) {
-    previewLink.href = slug ? '/' + encodeURIComponent(slug) : '#';
+    const exists = slug && (state.currentSlug === slug || state.posts.some((post) => post.postSlug === slug));
+    previewLink.href = exists ? '/preview/' + encodeURIComponent(slug) : '#';
+    previewLink.setAttribute('aria-disabled', exists ? 'false' : 'true');
   }
 }
 
@@ -2595,6 +3242,9 @@ function resetEditor() {
   contentInput.value = '';
   if (typeof updateSaveBtn === 'function') updateSaveBtn();
   syncPreview();
+  state.comments = [];
+  renderCommentAdminList();
+  setCommentAdminStatus('');
   setStatus('New post');
   tryRestoreDraft('');
 }
@@ -2623,6 +3273,61 @@ function renderPostList() {
   });
 }
 
+function setCommentAdminStatus(message, isError = false) {
+  if (!commentAdminStatusEl) {
+    return;
+  }
+  commentAdminStatusEl.textContent = message;
+  commentAdminStatusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+}
+
+function renderCommentAdminList() {
+  if (!commentAdminListEl) {
+    return;
+  }
+  if (!state.currentSlug) {
+    commentAdminListEl.innerHTML = '<li class="muted">請先選擇文章。</li>';
+    return;
+  }
+  if (!state.comments.length) {
+    commentAdminListEl.innerHTML = '<li class="muted">此文章目前沒有留言。</li>';
+    return;
+  }
+
+  commentAdminListEl.innerHTML = state.comments
+    .map((comment) => {
+      const authorSite = comment.authorSiteSlug
+        ? '<small class="muted"> · ' + escapeText(comment.authorSiteSlug) + '.bdfz.net</small>'
+        : '';
+      const createdAt = comment.createdAt
+        ? new Date(comment.createdAt).toLocaleString()
+        : '';
+      return '<li class="comment-item" data-comment-id="' + comment.id + '">' +
+        '<p class="comment-meta">' + escapeText(comment.authorName) + authorSite + ' · ' + escapeText(createdAt) + '</p>' +
+        '<p class="comment-content">' + escapeText(comment.content || '').replace(/\n/g, '<br />') + '</p>' +
+        '<button type="button" class="comment-delete-btn" data-comment-id="' + comment.id + '">刪除留言</button>' +
+      '</li>';
+    })
+    .join('');
+}
+
+async function refreshCommentsForCurrentPost() {
+  if (!state.currentSlug) {
+    state.comments = [];
+    renderCommentAdminList();
+    return;
+  }
+  setCommentAdminStatus('載入留言中...');
+  try {
+    const payload = await fetchJson('/api/admin/comments?postSlug=' + encodeURIComponent(state.currentSlug));
+    state.comments = payload.comments || [];
+    renderCommentAdminList();
+    setCommentAdminStatus('留言載入完成');
+  } catch (error) {
+    setCommentAdminStatus(error.message || '留言載入失敗', true);
+  }
+}
+
 async function fetchJson(path, options) {
   const response = await fetch(path, options);
   let payload = null;
@@ -2647,6 +3352,11 @@ async function refreshPosts() {
   const payload = await fetchJson('/api/list-posts?includeDrafts=1');
   state.posts = payload.posts || [];
   renderPostList();
+  if (!state.currentSlug && state.posts.length) {
+    loadPost(state.posts[0].postSlug).catch((error) => {
+      setStatus(error.message || 'Failed to load first post', true);
+    });
+  }
 }
 
 async function refreshSettings() {
@@ -2672,6 +3382,7 @@ async function loadPost(slug) {
     if (typeof updateSaveBtn === 'function') updateSaveBtn();
     renderPostList();
     tryRestoreDraft(post.postSlug);
+    await refreshCommentsForCurrentPost();
     setStatus('Loaded ' + post.postSlug);
   } catch (error) {
     setStatus(error.message || 'Failed to load post', true);
@@ -2715,6 +3426,7 @@ async function savePost() {
     postSlugInput.value = payload.post.postSlug;
     syncPreview();
     await refreshPosts();
+    await refreshCommentsForCurrentPost();
     if (publishedInput.checked) {
       setStatus('已發佈：' + new Date().toLocaleTimeString());
     } else {
@@ -2751,12 +3463,17 @@ async function saveSiteSettings() {
         headerLinks: parseHeaderLinks(siteHeaderLinksInput.value),
         hideCommunitySites: siteHideCommunitySitesInput.checked,
         hideCampusFeed: siteHideCampusFeedInput.checked,
+        commentsEnabled: siteCommentsEnabledInput.checked,
       }),
     });
 
     state.siteConfig = payload.config || state.siteConfig;
     applySettingsToForm(state.siteConfig);
-    document.body.className = "theme-" + (state.siteConfig.colorTheme || "default");
+    if (typeof window.__applyThemeDockTheme === 'function') {
+      window.__applyThemeDockTheme(state.siteConfig.colorTheme || 'default');
+    } else {
+      document.body.className = "theme-" + (state.siteConfig.colorTheme || "default");
+    }
     setSettingsStatus('站點設定已儲存');
   } catch (error) {
     setSettingsStatus(error.message || '儲存站點設定失敗', true);
@@ -2776,6 +3493,30 @@ document.getElementById('logout').addEventListener('click', async () => {
   location.reload();
 });
 
+if (commentAdminListEl) {
+  commentAdminListEl.addEventListener('click', async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const commentId = target.getAttribute('data-comment-id');
+    if (!commentId || !target.classList.contains('comment-delete-btn')) {
+      return;
+    }
+    if (!confirm('確認刪除此留言？')) {
+      return;
+    }
+    setCommentAdminStatus('刪除留言中...');
+    try {
+      await fetchJson('/api/comments/' + encodeURIComponent(commentId), { method: 'DELETE' });
+      await refreshCommentsForCurrentPost();
+      setCommentAdminStatus('留言已刪除');
+    } catch (error) {
+      setCommentAdminStatus(error.message || '刪除留言失敗', true);
+    }
+  });
+}
+
 titleInput.addEventListener('blur', () => {
   if (!postSlugInput.value.trim()) {
     postSlugInput.value = toSlug(titleInput.value);
@@ -2787,6 +3528,15 @@ postSlugInput.addEventListener('input', () => {
   postSlugInput.value = toSlug(postSlugInput.value);
   syncPreview();
 });
+
+if (previewLink) {
+  previewLink.addEventListener('click', (event) => {
+    if (previewLink.getAttribute('aria-disabled') === 'true') {
+      event.preventDefault();
+      setStatus('請先儲存文章後再預覽', true);
+    }
+  });
+}
 
 contentInput.addEventListener('input', saveDraft);
 titleInput.addEventListener('input', saveDraft);
@@ -2973,6 +3723,29 @@ function renderSimpleMessage(code, message) {
   );
 }
 
+function renderThemeControlDock(mode = "front") {
+  return `
+  <section id="theme-dock" class="theme-dock" data-mode="${escapeHtml(mode)}">
+    <label for="theme-dock-select">頁面色系</label>
+    <select id="theme-dock-select" aria-label="頁面色系">
+      <option value="default">Default</option>
+      <option value="ocean">Ocean</option>
+      <option value="forest">Forest</option>
+      <option value="violet">Violet</option>
+      <option value="sunset">Sunset</option>
+      <option value="mint">Mint</option>
+      <option value="graphite">Graphite</option>
+    </select>
+    <label for="contrast-dock-select">文字對比</label>
+    <select id="contrast-dock-select" aria-label="文字對比">
+      <option value="normal">標準</option>
+      <option value="soft">柔和</option>
+      <option value="strong">高對比</option>
+    </select>
+  </section>
+  `;
+}
+
 function renderLayout(title, body, colorTheme = 'default') {
   return `<!doctype html>
 <html lang="zh-Hant">
@@ -2998,12 +3771,14 @@ function renderLayout(title, body, colorTheme = 'default') {
   --font-mono: 'Fira Code','JetBrains Mono',Menlo,Consolas,monospace;
   --font-sans: 'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
 }
-.theme-ocean{--accent:#005c99;--accent-glow:rgba(0,92,153,0.15)}
-.theme-forest{--accent:#2e6040;--accent-glow:rgba(46,96,64,0.15)}
-.theme-violet{--accent:#6f42c1;--accent-glow:rgba(111,66,193,0.15)}
-.theme-sunset{--accent:#b9512e;--accent-glow:rgba(185,81,46,0.15)}
-.theme-mint{--accent:#1f8673;--accent-glow:rgba(31,134,115,0.15)}
-.theme-graphite{--accent:#475d82;--accent-glow:rgba(71,93,130,0.16)}
+.theme-ocean{--bg-1:#e9f3fb;--bg-2:#d9e9f8;--ink:#173042;--ink-2:#274459;--muted:#59768f;--panel:rgba(247,252,255,.92);--line:rgba(34,74,112,.18);--accent:#0a6fab;--accent-glow:rgba(10,111,171,.16);--code-bg:rgba(10,111,171,.1)}
+.theme-forest{--bg-1:#ebf4ef;--bg-2:#dcece3;--ink:#1f3329;--ink-2:#2d483b;--muted:#62786b;--panel:rgba(246,252,248,.92);--line:rgba(45,88,67,.18);--accent:#2f6c4b;--accent-glow:rgba(47,108,75,.16);--code-bg:rgba(47,108,75,.1)}
+.theme-violet{--bg-1:#f3effa;--bg-2:#e8def7;--ink:#2f2440;--ink-2:#3f3056;--muted:#6b5f83;--panel:rgba(252,248,255,.92);--line:rgba(77,56,117,.16);--accent:#7248b5;--accent-glow:rgba(114,72,181,.16);--code-bg:rgba(114,72,181,.1)}
+.theme-sunset{--bg-1:#f9eee7;--bg-2:#f2dfd3;--ink:#3b2418;--ink-2:#563627;--muted:#866450;--panel:rgba(255,249,245,.92);--line:rgba(128,74,49,.18);--accent:#b85b31;--accent-glow:rgba(184,91,49,.16);--code-bg:rgba(184,91,49,.1)}
+.theme-mint{--bg-1:#e8f6f2;--bg-2:#d6eee7;--ink:#17352f;--ink-2:#245048;--muted:#5d7f77;--panel:rgba(245,253,250,.92);--line:rgba(37,100,88,.18);--accent:#22826f;--accent-glow:rgba(34,130,111,.16);--code-bg:rgba(34,130,111,.1)}
+.theme-graphite{--bg-1:#edf0f5;--bg-2:#dfe5ee;--ink:#202936;--ink-2:#313d4d;--muted:#677180;--panel:rgba(248,251,255,.92);--line:rgba(61,79,103,.18);--accent:#4f6688;--accent-glow:rgba(79,102,136,.18);--code-bg:rgba(79,102,136,.1)}
+.contrast-soft{--ink:#4a473f;--ink-2:#5b554b;--muted:#7b7467}
+.contrast-strong{--ink:#1c1812;--ink-2:#2a241c;--muted:#4d473d}
 @media (prefers-color-scheme:dark) {
   :root {
     --bg-1: #0f1318;
@@ -3017,12 +3792,14 @@ function renderLayout(title, body, colorTheme = 'default') {
     --accent-glow: rgba(92,160,208,0.12);
     --code-bg: rgba(255,255,255,0.06);
   }
-  .theme-ocean{--accent:#4da6ff;--accent-glow:rgba(77,166,255,0.15)}
-  .theme-forest{--accent:#5eb082;--accent-glow:rgba(94,176,130,0.15)}
-  .theme-violet{--accent:#a580e6;--accent-glow:rgba(165,128,230,0.15)}
-  .theme-sunset{--accent:#ef8a63;--accent-glow:rgba(239,138,99,0.18)}
-  .theme-mint{--accent:#73cfbb;--accent-glow:rgba(115,207,187,0.18)}
-  .theme-graphite{--accent:#8ea3c8;--accent-glow:rgba(142,163,200,0.2)}
+  .theme-ocean{--bg-1:#0b1520;--bg-2:#122131;--ink:#c8ddf0;--ink-2:#acc8df;--muted:#7e97ad;--panel:rgba(15,29,44,.92);--line:rgba(102,162,224,.15);--accent:#5aaef6;--accent-glow:rgba(90,174,246,.18);--code-bg:rgba(90,174,246,.13)}
+  .theme-forest{--bg-1:#0f1815;--bg-2:#14241d;--ink:#cae3d8;--ink-2:#aed4c5;--muted:#83a698;--panel:rgba(18,33,28,.92);--line:rgba(101,166,133,.14);--accent:#6ab58f;--accent-glow:rgba(106,181,143,.18);--code-bg:rgba(106,181,143,.13)}
+  .theme-violet{--bg-1:#15111c;--bg-2:#21182d;--ink:#ded2f0;--ink-2:#c3b4de;--muted:#9f8fb9;--panel:rgba(32,23,44,.92);--line:rgba(152,121,215,.14);--accent:#a782e0;--accent-glow:rgba(167,130,224,.2);--code-bg:rgba(167,130,224,.14)}
+  .theme-sunset{--bg-1:#1d120f;--bg-2:#291915;--ink:#f0d2c6;--ink-2:#dfbaa9;--muted:#b08a79;--panel:rgba(43,26,21,.92);--line:rgba(199,128,96,.14);--accent:#ed946f;--accent-glow:rgba(237,148,111,.2);--code-bg:rgba(237,148,111,.14)}
+  .theme-mint{--bg-1:#0d1917;--bg-2:#112824;--ink:#c7ebe3;--ink-2:#abd8cd;--muted:#80a89e;--panel:rgba(17,35,31,.92);--line:rgba(106,190,171,.14);--accent:#74cdb7;--accent-glow:rgba(116,205,183,.2);--code-bg:rgba(116,205,183,.14)}
+  .theme-graphite{--bg-1:#11151b;--bg-2:#181f29;--ink:#d3dbe8;--ink-2:#b4c0d0;--muted:#8592a3;--panel:rgba(24,33,43,.92);--line:rgba(131,154,188,.14);--accent:#95aaca;--accent-glow:rgba(149,170,202,.2);--code-bg:rgba(149,170,202,.14)}
+  .contrast-soft{--ink:#b6c0ce;--ink-2:#9ca7b7;--muted:#7f8998}
+  .contrast-strong{--ink:#ecf2fb;--ink-2:#d2dced;--muted:#a8b3c2}
 }
 *{box-sizing:border-box;margin:0;padding:0}
 ::selection{background:var(--accent-glow)}
@@ -3048,6 +3825,7 @@ textarea{min-height:360px;resize:vertical;line-height:1.65}
 button,.link-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--accent);cursor:pointer;padding:.62rem .95rem;background:var(--accent);color:#f7eee2;text-decoration:none;font-weight:500;transition:all .2s;min-height:44px}
 button:hover,.link-button:hover{filter:brightness(1.08);transform:translateY(-1px)}
 button:active,.link-button:active{transform:translateY(0)}
+.link-button[aria-disabled="true"]{opacity:.45;pointer-events:auto;filter:none}
 .site-header{display:flex;align-items:start;justify-content:space-between;gap:1rem;margin-bottom:1rem}
 .post-list{display:grid;gap:.9rem;margin:1rem 0 0;padding:0;list-style:none}
 .post-item{border-bottom:1px dashed var(--line);padding-bottom:.7rem;transition:transform .15s}
@@ -3064,6 +3842,14 @@ button:active,.link-button:active{transform:translateY(0)}
 .mini-list a{text-decoration:none;transition:color .2s}
 .mini-list a:hover{color:var(--accent)}
 .site-footer{margin-top:1.2rem;border-top:1px dashed var(--line);padding-top:.75rem;font-family:var(--font-mono);font-size:.82rem}
+.pager{display:flex;align-items:center;gap:.8rem;margin-top:1rem;flex-wrap:wrap}
+.pager a{text-decoration:none;border:1px solid var(--line);padding:.3rem .7rem;border-radius:999px;color:var(--ink);transition:all .2s}
+.pager a:hover{border-color:var(--accent);color:var(--accent)}
+.pager a.disabled{opacity:.4;pointer-events:none}
+.preview-badge{display:inline-block;margin-left:.4rem;padding:.1rem .4rem;border-radius:999px;border:1px solid var(--line);font-size:.7rem;letter-spacing:.04em}
+.theme-dock{display:flex;flex-wrap:wrap;align-items:center;gap:.45rem;margin:.8rem 0;padding:.55rem;border:1px solid var(--line);border-radius:12px;background:var(--code-bg)}
+.theme-dock label{font-size:.74rem;margin-right:.15rem}
+.theme-dock select{min-width:124px;max-width:100%;padding:.35rem .45rem;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font-family:var(--font-mono);font-size:.8rem}
 /* article */
 .article-body{line-height:1.78;font-size:1.05rem}
 .article-body h2,.article-body h3,.article-body h4{margin-top:1.6rem}
@@ -3080,6 +3866,16 @@ button:active,.link-button:active{transform:translateY(0)}
 .article-body code{background:var(--code-bg);padding:.12rem .35rem;border-radius:4px;font-size:.88em;font-family:var(--font-mono)}
 .article-body pre code{background:none;padding:0;font-size:inherit}
 .read-time{font-family:var(--font-mono);font-size:.78rem;color:var(--muted);margin-left:.5rem}
+.comment-panel{margin-top:1rem}
+.comment-list{list-style:none;margin:1rem 0 0;padding:0;display:grid;gap:.75rem}
+.comment-list.compact{gap:.5rem}
+.comment-item{border:1px solid var(--line);background:rgba(255,255,255,.48);border-radius:10px;padding:.65rem .75rem}
+@media(prefers-color-scheme:dark){.comment-item{background:rgba(255,255,255,.03)}}
+.comment-meta{font-family:var(--font-mono);font-size:.76rem;color:var(--muted);margin-bottom:.28rem}
+.comment-content{white-space:normal;overflow-wrap:anywhere}
+.comment-delete-btn{margin-top:.45rem;background:transparent;color:var(--muted);border:1px solid var(--line);padding:.36rem .62rem;min-height:34px}
+.comment-delete-btn:hover{color:var(--accent);border-color:var(--accent);transform:none}
+.comments-pager{margin-top:.35rem}
 /* back to top */
 .back-top{position:fixed;bottom:1.5rem;right:1.5rem;width:42px;height:42px;border-radius:50%;background:var(--accent);color:#fff;border:none;font-size:1.1rem;cursor:pointer;opacity:0;transform:translateY(10px);transition:all .25s;z-index:100;display:flex;align-items:center;justify-content:center}
 .back-top.visible{opacity:1;transform:translateY(0)}
@@ -3094,8 +3890,11 @@ button:active,.link-button:active{transform:translateY(0)}
 .admin-list{border-right:1px solid var(--line);padding-right:1rem;display:grid;gap:.5rem;align-content:start}
 .admin-list ul{list-style:none;margin:0;padding:0;display:grid;gap:.4rem}
 .settings-grid{display:grid;grid-template-columns:1fr 280px;gap:2rem}
+.settings-grid > *{min-width:0}
 .settings-form{display:grid;gap:.5rem;align-content:start}
 .settings-aside{border-left:1px solid var(--line);padding-left:1.5rem;display:grid;gap:.5rem;align-content:start}
+.settings-aside input[type="file"]{max-width:100%;width:100%;min-width:0}
+.settings-aside #import-btn{width:100%}
 .post-item-btn{width:100%;text-align:left;background:rgba(255,255,255,.55);color:var(--ink);border:1px solid var(--line);font-size:.88rem;transition:all .15s}
 @media(prefers-color-scheme:dark){.post-item-btn{background:rgba(255,255,255,.04)}}
 .post-item-btn:hover{border-color:var(--accent)}
@@ -3109,6 +3908,7 @@ button:active,.link-button:active{transform:translateY(0)}
 .row-actions{display:flex;flex-wrap:wrap;gap:.5rem}
 .inline-check{display:inline-flex;align-items:center;gap:.5rem;margin:.4rem 0}
 .inline-check input[type="checkbox"]{width:18px;height:18px;accent-color:var(--accent)}
+.comment-admin-panel{margin-top:.8rem;display:grid;gap:.5rem}
 a{color:var(--accent)}
 code{font-family:var(--font-mono)}
 /* fullscreen overlay */
@@ -3124,10 +3924,15 @@ code{font-family:var(--font-mono)}
   .settings-grid{grid-template-columns:1fr}
   .settings-aside{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:1rem}
   .site-header{flex-direction:column;align-items:stretch}
+  .site-header .row-actions{width:100%}
+  .site-header .row-actions .link-button,
+  .site-header .row-actions button{flex:1}
   .community-grid{grid-template-columns:1fr}
   .community-panel{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:.9rem}
   .article-wrap{grid-template-columns:1fr}
   .article-side{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:.8rem}
+  .theme-dock{display:grid;grid-template-columns:1fr;gap:.4rem}
+  .theme-dock select{width:100%}
   input,textarea,button,.link-button{font-size:16px;min-height:44px}
   textarea{min-height:60vh}
   .admin-editor .row-actions{position:sticky;bottom:0;background:var(--panel);padding:.5rem;border:1px solid var(--line);border-radius:10px;z-index:10}
@@ -3136,13 +3941,93 @@ code{font-family:var(--font-mono)}
 @media(max-width:480px){
   .panel{padding:.9rem;border-radius:12px}
   h1{font-size:1.3rem}
+  .admin-tabs{overflow:auto;scrollbar-width:thin}
+  .post-item-btn{font-size:.82rem}
 }
     </style>
   </head>
-  <body class="theme-${escapeHtml(colorTheme)}">
+  <body class="theme-${escapeHtml(colorTheme)}" data-default-theme="${escapeHtml(colorTheme)}">
     <main>
       ${body}
     </main>
+    <script>
+      (function () {
+        const availableThemes = ['default', 'ocean', 'forest', 'violet', 'sunset', 'mint', 'graphite'];
+        const availableContrasts = ['normal', 'soft', 'strong'];
+        const body = document.body;
+        const dock = document.getElementById('theme-dock');
+        const themeSelect = document.getElementById('theme-dock-select');
+        const contrastSelect = document.getElementById('contrast-dock-select');
+        const storageThemeKey = 'stublogs-theme:' + location.host;
+        const storageContrastKey = 'stublogs-contrast:' + location.host;
+        function safeGet(key) {
+          try {
+            return localStorage.getItem(key);
+          } catch {
+            return null;
+          }
+        }
+        function safeSet(key, value) {
+          try {
+            localStorage.setItem(key, value);
+          } catch {
+            // ignore
+          }
+        }
+
+        function applyTheme(theme, persist) {
+          const nextTheme = availableThemes.includes(theme) ? theme : 'default';
+          availableThemes.forEach((item) => body.classList.remove('theme-' + item));
+          body.classList.add('theme-' + nextTheme);
+          if (themeSelect) {
+            themeSelect.value = nextTheme;
+          }
+          if (persist) {
+            safeSet(storageThemeKey, nextTheme);
+          }
+          return nextTheme;
+        }
+
+        function applyContrast(level, persist) {
+          const next = availableContrasts.includes(level) ? level : 'normal';
+          body.classList.remove('contrast-soft', 'contrast-strong');
+          if (next === 'soft') {
+            body.classList.add('contrast-soft');
+          } else if (next === 'strong') {
+            body.classList.add('contrast-strong');
+          }
+          if (contrastSelect) {
+            contrastSelect.value = next;
+          }
+          if (persist) {
+            safeSet(storageContrastKey, next);
+          }
+          return next;
+        }
+
+        window.__applyThemeDockTheme = function(theme) {
+          applyTheme(theme, true);
+        };
+
+        const defaultTheme = body.getAttribute('data-default-theme') || 'default';
+        const canCustomizeTheme = Boolean(dock && themeSelect && contrastSelect);
+        const storedTheme = canCustomizeTheme ? (safeGet(storageThemeKey) || defaultTheme) : defaultTheme;
+        const storedContrast = canCustomizeTheme ? (safeGet(storageContrastKey) || 'normal') : 'normal';
+        applyTheme(storedTheme, false);
+        applyContrast(storedContrast, false);
+
+        if (themeSelect) {
+          themeSelect.addEventListener('change', () => {
+            applyTheme(themeSelect.value, true);
+          });
+        }
+        if (contrastSelect) {
+          contrastSelect.addEventListener('change', () => {
+            applyContrast(contrastSelect.value, true);
+          });
+        }
+      })();
+    </script>
   </body>
 </html>`;
 }
