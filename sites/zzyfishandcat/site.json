@@ -4,7 +4,7 @@
   "description": "一条养猫的鱼",
   "heroTitle": "",
   "heroSubtitle": "",
-  "colorTheme": "default",
+  "colorTheme": "violet",
   "footerNote": "",
   "customCss": "",
   "faviconUrl": "https://img.bdfz.net/20250503004.webp",
@@ -13,6 +13,6 @@
   "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-22T07:02:53.015Z",
-  "updatedAt": "2026-02-22T07:02:53.015Z",
+  "updatedAt": "2026-02-22T07:04:26.421Z",
   "exportVersion": 3
 }
