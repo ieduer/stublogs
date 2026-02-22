@@ -4,7 +4,7 @@
   "description": "你是？我是？",
   "heroTitle": "",
   "heroSubtitle": "",
-  "colorTheme": "default",
+  "colorTheme": "ocean",
   "footerNote": "",
   "customCss": "",
   "faviconUrl": "https://pic1.imgdb.cn/item/699aef29ba83e2a3a4821eac.png",
@@ -13,6 +13,6 @@
   "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-22T11:52:14.345Z",
-  "updatedAt": "2026-02-22T11:56:18.644Z",
+  "updatedAt": "2026-02-22T14:35:14.128Z",
   "exportVersion": 3
 }
