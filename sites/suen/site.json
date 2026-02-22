@@ -20,8 +20,8 @@
   ],
   "hideCommunitySites": false,
   "hideCampusFeed": false,
-  "commentsEnabled": false,
+  "commentsEnabled": true,
   "createdAt": "2026-02-21T10:58:26.703Z",
-  "updatedAt": "2026-02-22T08:42:02.786Z",
+  "updatedAt": "2026-02-22T08:42:12.563Z",
   "exportVersion": 3
 }
