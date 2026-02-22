@@ -6,13 +6,13 @@
   "heroSubtitle": "",
   "colorTheme": "graphite",
   "footerNote": "我也不知道应该写点什么...",
-  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n}\n.panel {\n    background: transparent;\n    border: none;\n    box-shadow: none;\n}\n* {\n    --accent: rgb(63 81 181);\n}\nblockquote {\n    background: none !important;\n}\n.post-item {\n    background: #1e1e1e;\n    border-radius: 10px;\n    padding: 20px;\n    box-shadow: rgb(21 21 21 / 72%) 0 6px 18px 0, rgb(137 135 135 / 24%) 0 0 0 1px;\n}",
+  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n}\n.panel {\n    background: transparent;\n    border: none;\n    box-shadow: none;\n}\n* {\n    --accent: rgb(63 81 181);\n}\nblockquote {\n    background: none !important;\n}\n.post-item {\n    background: #1e1e1e;\n    border-radius: 10px;\n    padding: 20px;\n    box-shadow: rgb(21 21 21 / 72%) 0 6px 18px 0, rgb(137 135 135 / 24%) 0 0 0 1px;\n}\n.site-home-shell .link-button[href=\"/admin\"] {\n    display: none;\n}",
   "faviconUrl": "https://www.tachyon.moe/image/cyan.png",
   "headerLinks": [],
   "hideCommunitySites": true,
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-22T10:07:44.019Z",
+  "updatedAt": "2026-02-22T10:08:57.124Z",
   "exportVersion": 3
 }
