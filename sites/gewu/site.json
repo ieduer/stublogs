@@ -8,11 +8,16 @@
   "footerNote": "",
   "customCss": "",
   "faviconUrl": "https://img.bdfz.net/20250503004.webp",
-  "headerLinks": [],
+  "headerLinks": [
+    {
+      "label": "格物语雀",
+      "url": "https://pkuschool.yuque.com/gewu"
+    }
+  ],
   "hideCommunitySites": false,
   "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-22T05:01:22.006Z",
-  "updatedAt": "2026-02-22T05:02:19.430Z",
+  "updatedAt": "2026-02-22T05:04:50.014Z",
   "exportVersion": 3
 }
