@@ -10,7 +10,7 @@
   "faviconUrl": "https://img.bdfz.net/20250503004.webp",
   "headerLinks": [
     {
-      "label": "Blgo",
+      "label": "Blog",
       "url": "https://www.tachyon.moe"
     }
   ],
@@ -18,6 +18,6 @@
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-22T08:47:32.398Z",
+  "updatedAt": "2026-02-22T08:47:45.964Z",
   "exportVersion": 3
 }
