@@ -6,11 +6,18 @@
   "heroSubtitle": "",
   "colorTheme": "graphite",
   "footerNote": "我也不知道应该写点什么...",
-  "headerLinks": [],
+  "customCss": "",
+  "faviconUrl": "https://img.bdfz.net/20250503004.webp",
+  "headerLinks": [
+    {
+      "label": "Blgo",
+      "url": "https://www.tachyon.moe"
+    }
+  ],
   "hideCommunitySites": true,
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-21T15:19:15.228Z",
-  "exportVersion": 2
+  "updatedAt": "2026-02-22T08:46:40.064Z",
+  "exportVersion": 3
 }
