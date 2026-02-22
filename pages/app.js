@@ -18,7 +18,7 @@ let timer = null;
 let pollTimer = null;
 let allSites = [];
 const THEME_KEY = "stublogs-home-theme";
-const ALLOWED_THEMES = new Set(["default", "paper", "forest", "ocean", "amber", "graphite"]);
+const ALLOWED_THEMES = new Set(["default", "ocean", "forest", "violet", "sunset", "mint", "graphite"]);
 
 /* ── Helpers ── */
 

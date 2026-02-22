@@ -15,19 +15,19 @@
   --panel-shadow: 0 20px 56px rgba(2, 6, 12, 0.58);
 }
 
-body[data-theme='paper'] {
-  --bg: #f6f1e8;
-  --bg-2: #ece2d4;
-  --bg-card: rgba(255, 252, 247, 0.9);
-  --bg-input: #fffdfa;
-  --ink: #4d4035;
-  --ink-bright: #1f1913;
-  --muted: #7d6d60;
-  --line: rgba(126, 93, 61, 0.2);
-  --accent: #8d5b35;
-  --accent-soft: rgba(141, 91, 53, 0.2);
-  --danger: #a33232;
-  --panel-shadow: 0 24px 48px rgba(90, 71, 54, 0.18);
+body[data-theme='violet'] {
+  --bg: #15111c;
+  --bg-2: #21182d;
+  --bg-card: rgba(32, 23, 44, 0.9);
+  --bg-input: rgba(24, 17, 35, 0.95);
+  --ink: #ded2f0;
+  --ink-bright: #f2eaff;
+  --muted: #9f8fb9;
+  --line: rgba(152, 121, 215, 0.22);
+  --accent: #a782e0;
+  --accent-soft: rgba(167, 130, 224, 0.24);
+  --danger: #ff9aa5;
+  --panel-shadow: 0 20px 56px rgba(16, 12, 24, 0.62);
 }
 
 body[data-theme='forest'] {
@@ -60,19 +60,34 @@ body[data-theme='ocean'] {
   --panel-shadow: 0 20px 56px rgba(6, 12, 20, 0.56);
 }
 
-body[data-theme='amber'] {
-  --bg: #18130d;
-  --bg-2: #2a1f13;
-  --bg-card: rgba(40, 28, 19, 0.88);
-  --bg-input: rgba(25, 18, 13, 0.95);
-  --ink: #e2d4c1;
-  --ink-bright: #fff8ec;
-  --muted: #b09b7d;
-  --line: rgba(231, 179, 104, 0.2);
-  --accent: #efbf72;
-  --accent-soft: rgba(239, 191, 114, 0.22);
+body[data-theme='sunset'] {
+  --bg: #1d120f;
+  --bg-2: #291915;
+  --bg-card: rgba(43, 26, 21, 0.9);
+  --bg-input: rgba(30, 18, 15, 0.95);
+  --ink: #f0d2c6;
+  --ink-bright: #fff0e9;
+  --muted: #b08a79;
+  --line: rgba(199, 128, 96, 0.2);
+  --accent: #ed946f;
+  --accent-soft: rgba(237, 148, 111, 0.22);
   --danger: #ff9a81;
-  --panel-shadow: 0 20px 56px rgba(16, 10, 6, 0.62);
+  --panel-shadow: 0 20px 56px rgba(16, 10, 8, 0.62);
+}
+
+body[data-theme='mint'] {
+  --bg: #0d1917;
+  --bg-2: #112824;
+  --bg-card: rgba(17, 35, 31, 0.9);
+  --bg-input: rgba(12, 26, 23, 0.95);
+  --ink: #c7ebe3;
+  --ink-bright: #ecfff9;
+  --muted: #80a89e;
+  --line: rgba(106, 190, 171, 0.22);
+  --accent: #74cdb7;
+  --accent-soft: rgba(116, 205, 183, 0.24);
+  --danger: #ff9aa0;
+  --panel-shadow: 0 20px 56px rgba(8, 16, 14, 0.62);
 }
 
 body[data-theme='graphite'] {

@@ -254,6 +254,28 @@ async function handleRequest(request, env, ctx) {
     );
   }
 
+  if (path === "/feed.xml") {
+    const siteConfig = await getSiteConfig(env, site);
+    const posts = await listPosts(env, site.id, false);
+    return xml(
+      renderSiteRssXml(site, siteConfig, posts, baseDomain),
+      200,
+      { "Cache-Control": PUBLIC_SSR_CACHE_CONTROL }
+    );
+  }
+
+  if (path === "/sitemap.xml") {
+    const [posts, pages] = await Promise.all([
+      listPosts(env, site.id, false),
+      listSitePages(env, site.id, 200),
+    ]);
+    return xml(
+      renderSiteSitemapXml(site, posts, pages, baseDomain),
+      200,
+      { "Cache-Control": PUBLIC_SSR_CACHE_CONTROL }
+    );
+  }
+
   if (path === "/") {
     const siteConfig = await getSiteConfig(env, site);
     const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
@@ -3060,6 +3082,16 @@ function text(body, status = 200) {
   });
 }
 
+function xml(body, status = 200, extraHeaders = {}) {
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "application/xml; charset=utf-8",
+      ...extraHeaders,
+    },
+  });
+}
+
 function html(body, status = 200, extraHeaders = {}) {
   return new Response(body, {
     status,
@@ -3072,6 +3104,15 @@ function html(body, status = 200, extraHeaders = {}) {
       ...extraHeaders,
     },
   });
+}
+
+function escapeXml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function notFound(message = "Not found") {
@@ -3413,6 +3454,75 @@ function renderSiteHomePage(
   );
 }
 
+function renderSiteRssXml(site, siteConfig, posts, baseDomain) {
+  const siteUrl = `https://${site.slug}.${baseDomain}`;
+  const safePosts = Array.isArray(posts) ? posts.slice(0, 80) : [];
+  const now = new Date().toUTCString();
+
+  const items = safePosts
+    .map((post) => {
+      const postUrl = `${siteUrl}/${encodeURIComponent(post.postSlug)}`;
+      const publishedAt = new Date(post.updatedAt || post.createdAt || Date.now()).toUTCString();
+      const description = post.description || "";
+      return [
+        "<item>",
+        `<title>${escapeXml(post.title || post.postSlug)}</title>`,
+        `<link>${escapeXml(postUrl)}</link>`,
+        `<guid>${escapeXml(postUrl)}</guid>`,
+        `<pubDate>${escapeXml(publishedAt)}</pubDate>`,
+        `<description>${escapeXml(description)}</description>`,
+        "</item>",
+      ].join("");
+    })
+    .join("");
+
+  const channelTitle = siteConfig.heroTitle || site.displayName;
+  const channelDescription = siteConfig.heroSubtitle || site.description || `${site.displayName} 的最新文章`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>${escapeXml(channelTitle)}</title>
+    <link>${escapeXml(siteUrl)}</link>
+    <description>${escapeXml(channelDescription)}</description>
+    <language>zh-Hant</language>
+    <lastBuildDate>${escapeXml(now)}</lastBuildDate>
+    ${items}
+  </channel>
+</rss>`;
+}
+
+function renderSiteSitemapXml(site, posts, pages, baseDomain) {
+  const siteUrl = `https://${site.slug}.${baseDomain}`;
+  const urls = [
+    { loc: `${siteUrl}/`, lastmod: site.updatedAt || site.createdAt || new Date().toISOString() },
+  ];
+
+  for (const post of Array.isArray(posts) ? posts : []) {
+    urls.push({
+      loc: `${siteUrl}/${encodeURIComponent(post.postSlug)}`,
+      lastmod: post.updatedAt || post.createdAt || new Date().toISOString(),
+    });
+  }
+  for (const page of Array.isArray(pages) ? pages : []) {
+    urls.push({
+      loc: `${siteUrl}/${encodeURIComponent(page.postSlug)}`,
+      lastmod: page.updatedAt || page.createdAt || new Date().toISOString(),
+    });
+  }
+
+  const body = urls
+    .map((item) => {
+      const lastmod = new Date(item.lastmod).toISOString();
+      return `<url><loc>${escapeXml(item.loc)}</loc><lastmod>${escapeXml(lastmod)}</lastmod></url>`;
+    })
+    .join("");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  ${body}
+</urlset>`;
+}
+
 function renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, options = {}) {
   const previewMode = Boolean(options.previewMode);
   const commentsEnabled = options.commentsEnabled !== false;
@@ -3425,7 +3535,6 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
   const commentsTotal = Number(options.commentsTotal || comments.length || 0);
   const showCommunityPanel = !siteConfig.hideCommunitySites;
   const canonicalPostUrl = `https://${site.slug}.${baseDomain}/${encodeURIComponent(post.postSlug)}`;
-  const previewPostUrl = `https://${site.slug}.${baseDomain}/preview/${encodeURIComponent(post.postSlug)}`;
 
   const peerSites = communitySites.length
     ? communitySites
@@ -3658,7 +3767,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
       title: post.title,
       description: post.description || site.description || `${site.displayName} 的文章`,
       type: "article",
-      url: previewMode ? previewPostUrl : canonicalPostUrl,
+      url: canonicalPostUrl,
     }
   );
 }
@@ -4986,6 +5095,10 @@ function renderLayout(
   const normalizedFaviconUrl = sanitizeFaviconUrl(faviconUrl || DEFAULT_FAVICON_URL);
   const faviconMime = inferFaviconMimeType(normalizedFaviconUrl);
   const ogMetaTags = renderOgMetaTags(ogMeta, title);
+  const canonicalUrl = sanitizeUrl((ogMeta && ogMeta.url) || "");
+  const canonicalLink = canonicalUrl
+    ? `<link rel="canonical" href="${escapeHtml(canonicalUrl)}" />`
+    : "";
   return `<!doctype html>
 <html lang="zh-Hant">
   <head>
@@ -4997,6 +5110,7 @@ function renderLayout(
     <link rel="icon" href="${escapeHtml(normalizedFaviconUrl)}" type="${escapeHtml(faviconMime)}" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
     <title>${escapeHtml(title)}</title>
+    ${canonicalLink}
     ${ogMetaTags}
     <style>
 :root {
