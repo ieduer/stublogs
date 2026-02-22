@@ -6,13 +6,13 @@
   "heroSubtitle": "",
   "colorTheme": "graphite",
   "footerNote": "我也不知道应该写点什么...",
-  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n}\n.panel {\n    background: #1e1e1e !important;\n}\n.community-grid section {\n    border: 0;\n    background: none;\n\n    %img-radius {\n      border-radius: v.$radius-lg v.$radius-lg 0 0;\n\n      @include bp.md {\n        border-radius: 0 v.$radius-lg v.$radius-lg 0;\n      }\n    }\n\n    .preview-img {\n      @extend %img-radius;\n\n      img {\n        @extend %img-radius;\n      }\n    }\n\n    .card-body {\n      height: 100%;\n      padding: 1rem;\n\n      @include bp.md {\n        padding: 1.75rem 1.75rem 1.25rem;\n      }\n\n      .card-title {\n        @extend %text-clip;\n\n        color: var(--heading-color) !important;\n        font-size: 1.25rem;\n      }\n\n      %muted {\n        color: var(--text-muted-color) !important;\n      }\n\n      .card-text {\n        @include bp.md {\n          display: inherit !important;\n        }\n\n        &.content {\n          @extend %muted;\n\n          p {\n            @extend %text-clip;\n\n            line-height: 1.5;\n            margin: 0;\n          }\n        }\n      }\n\n      .post-meta {\n        @extend %muted;\n\n        i {\n          &:not(:first-child) {\n            margin-left: 1.5rem;\n\n            @include bp.md {\n              margin-left: 1.75rem;\n            }\n          }\n        }\n\n        em {\n          @extend %normal-font-style;\n\n          color: inherit;\n        }\n\n        > div:first-child {\n          display: block;\n\n          @extend %text-ellipsis;\n        }\n      }\n    }\n  }",
+  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n}\n.panel {\n    background: #1e1e1e !important;\n}",
   "faviconUrl": "https://www.tachyon.moe/image/cyan.png",
   "headerLinks": [],
   "hideCommunitySites": true,
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-22T09:55:20.781Z",
+  "updatedAt": "2026-02-22T09:57:07.284Z",
   "exportVersion": 3
 }
