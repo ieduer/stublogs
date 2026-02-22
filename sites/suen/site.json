@@ -18,10 +18,10 @@
       "url": "https://forum.rdfzer.com/latest"
     }
   ],
-  "hideCommunitySites": true,
-  "hideCampusFeed": true,
+  "hideCommunitySites": false,
+  "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T10:58:26.703Z",
-  "updatedAt": "2026-02-22T08:41:41.917Z",
+  "updatedAt": "2026-02-22T08:41:59.483Z",
   "exportVersion": 3
 }
