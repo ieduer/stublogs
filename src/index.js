@@ -323,16 +323,19 @@ async function handleRequest(request, env, ctx) {
     }
 
     const siteConfig = await getSiteConfig(env, site);
-    const communitySites = !siteConfig.hideCommunitySites
-      ? await listCommunitySites(env, site.slug, 8)
-      : [];
+    const [communitySites, sitePages] = await Promise.all([
+      siteConfig.hideCommunitySites
+        ? Promise.resolve([])
+        : listCommunitySites(env, site.slug, 8),
+      listSitePages(env, site.id, 20),
+    ]);
     const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
     const commentsData = siteConfig.commentsEnabled
       ? await listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
       : { comments: [], page: 1, totalPages: 1, total: 0 };
     const articleHtml = renderMarkdown(file.content);
     return html(
-      renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, {
+      renderPostPage(site, siteConfig, post, articleHtml, communitySites, sitePages, baseDomain, {
         previewMode: true,
         comments: commentsData.comments,
         commentsPage: commentsData.page,
@@ -366,16 +369,19 @@ async function handleRequest(request, env, ctx) {
   }
 
   const siteConfig = await getSiteConfig(env, site);
-  const communitySites = !siteConfig.hideCommunitySites
-    ? await listCommunitySites(env, site.slug, 8)
-    : [];
+  const [communitySites, sitePages] = await Promise.all([
+    siteConfig.hideCommunitySites
+      ? Promise.resolve([])
+      : listCommunitySites(env, site.slug, 8),
+    listSitePages(env, site.id, 20),
+  ]);
   const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
   const commentsData = siteConfig.commentsEnabled
     ? await listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
     : { comments: [], page: 1, totalPages: 1, total: 0 };
   const articleHtml = renderMarkdown(file.content);
   return html(
-    renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, {
+    renderPostPage(site, siteConfig, post, articleHtml, communitySites, sitePages, baseDomain, {
       comments: commentsData.comments,
       commentsPage: commentsData.page,
       commentsTotalPages: commentsData.totalPages,
@@ -3325,6 +3331,63 @@ function renderRootAdminHelp(baseDomain) {
   );
 }
 
+const SITE_PAGE_NAV_PRIORITY = Object.freeze({
+  home: 0,
+  now: 1,
+  projects: 2,
+});
+
+function sortSitePagesForNav(sitePages) {
+  const pages = Array.isArray(sitePages) ? [...sitePages] : [];
+  pages.sort((left, right) => {
+    const leftSlug = String(left?.postSlug || "").toLowerCase();
+    const rightSlug = String(right?.postSlug || "").toLowerCase();
+    const leftPriority = Object.prototype.hasOwnProperty.call(
+      SITE_PAGE_NAV_PRIORITY,
+      leftSlug
+    )
+      ? SITE_PAGE_NAV_PRIORITY[leftSlug]
+      : 99;
+    const rightPriority = Object.prototype.hasOwnProperty.call(
+      SITE_PAGE_NAV_PRIORITY,
+      rightSlug
+    )
+      ? SITE_PAGE_NAV_PRIORITY[rightSlug]
+      : 99;
+    if (leftPriority !== rightPriority) {
+      return leftPriority - rightPriority;
+    }
+    const leftUpdated = Date.parse(left?.updatedAt || left?.createdAt || "") || 0;
+    const rightUpdated = Date.parse(right?.updatedAt || right?.createdAt || "") || 0;
+    if (leftUpdated !== rightUpdated) {
+      return rightUpdated - leftUpdated;
+    }
+    return leftSlug.localeCompare(rightSlug);
+  });
+  return pages;
+}
+
+function renderSiteModeNav(sitePages, activeSlug = "blog") {
+  const sortedPages = sortSitePagesForNav(sitePages);
+  if (!sortedPages.length) {
+    return "";
+  }
+
+  const normalizedActiveSlug = String(activeSlug || "blog").toLowerCase();
+  const pageLinks = sortedPages
+    .map((item) => {
+      const slug = String(item.postSlug || "").toLowerCase();
+      const activeClass = slug === normalizedActiveSlug ? "active" : "";
+      return `<a class="${activeClass}" href="/${encodeURIComponent(item.postSlug)}">${escapeHtml(
+        item.title
+      )}</a>`;
+    })
+    .join("");
+  const blogActiveClass = normalizedActiveSlug === "blog" ? "active" : "";
+
+  return `<nav class="site-nav mode-nav" aria-label="站點導覽">${pageLinks}<a class="${blogActiveClass}" href="/">Blog</a></nav>`;
+}
+
 function renderSiteHomePage(
   site,
   siteConfig,
@@ -3350,14 +3413,7 @@ function renderSiteHomePage(
       .join("")}</nav>`
     : "";
 
-  const pagesNav = sitePages.length
-    ? `<nav class="site-nav page-nav">${sitePages
-      .map(
-        (item) =>
-          `<a href="/${encodeURIComponent(item.postSlug)}">${escapeHtml(item.title)}</a>`
-      )
-      .join("")}</nav>`
-    : "";
+  const modeNav = renderSiteModeNav(sitePages, "blog");
 
   const list = posts.length
     ? posts
@@ -3419,7 +3475,7 @@ function renderSiteHomePage(
       </header>
       ${renderThemeControlDock("front")}
       ${navLinks}
-      ${pagesNav ? `<h3>頁面</h3>${pagesNav}` : ""}
+      ${modeNav}
 
       <div class="community-grid">
         <section>
@@ -3523,7 +3579,16 @@ function renderSiteSitemapXml(site, posts, pages, baseDomain) {
 </urlset>`;
 }
 
-function renderPostPage(site, siteConfig, post, articleHtml, communitySites, baseDomain, options = {}) {
+export function renderPostPage(
+  site,
+  siteConfig,
+  post,
+  articleHtml,
+  communitySites,
+  sitePages,
+  baseDomain,
+  options = {}
+) {
   const previewMode = Boolean(options.previewMode);
   const commentsEnabled = options.commentsEnabled !== false;
   const comments = Array.isArray(options.comments) ? options.comments : [];
@@ -3535,6 +3600,10 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
   const commentsTotal = Number(options.commentsTotal || comments.length || 0);
   const showCommunityPanel = !siteConfig.hideCommunitySites;
   const canonicalPostUrl = `https://${site.slug}.${baseDomain}/${encodeURIComponent(post.postSlug)}`;
+  const modeNav = renderSiteModeNav(
+    sitePages,
+    Number(post.isPage) === 1 ? post.postSlug : "blog"
+  );
 
   const peerSites = communitySites.length
     ? communitySites
@@ -3575,7 +3644,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
 
   return renderLayout(
     `${post.title} - ${site.displayName}`,
-    `
+    String.raw`
     <div class="reading-progress" id="reading-progress"></div>
     <section class="panel wide article-wrap">
       <article class="article">
@@ -3585,6 +3654,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
         <h1>${escapeHtml(post.title)}</h1>
         <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span></p>
         ${renderThemeControlDock("front")}
+        ${modeNav}
         <div class="article-body">${articleHtml}</div>
       </article>
       ${showCommunityPanel ? `
@@ -5193,6 +5263,9 @@ button:active,.link-button:active{transform:translateY(0)}
 .site-nav{display:flex;flex-wrap:wrap;gap:.45rem;margin:.6rem 0 1rem}
 .site-nav a{border:1px solid var(--line);border-radius:999px;padding:.35rem .65rem;text-decoration:none;color:var(--ink);font-size:.88rem;transition:all .2s}
 .site-nav a:hover{border-color:var(--accent);color:var(--accent)}
+.mode-nav{margin-top:.25rem}
+.mode-nav a.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.mode-nav a.active:hover{color:#fff;filter:brightness(1.04)}
 .community-grid{display:grid;grid-template-columns:1fr 300px;gap:1.2rem}
 .community-panel{border-left:1px solid var(--line);padding-left:1rem}
 .mini-list{list-style:none;padding:0;margin:0 0 1rem;display:grid;gap:.35rem}
