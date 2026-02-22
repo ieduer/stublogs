@@ -35,6 +35,7 @@ const PASSWORD_SCRYPT_R = 8;
 const PASSWORD_SCRYPT_P = 1;
 const PASSWORD_SCRYPT_KEYLEN = 32;
 const PUBLIC_SSR_CACHE_CONTROL = "public, s-maxage=60, stale-while-revalidate=120";
+const PRIVATE_NO_CACHE_CONTROL = "private, no-cache";
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
@@ -246,7 +247,11 @@ async function handleRequest(request, env, ctx) {
   if (path === "/admin") {
     const authed = await isSiteAuthenticated(request, env, site.slug);
     const siteConfig = await getSiteConfig(env, site);
-    return html(renderAdminPage(site, siteConfig, authed, baseDomain), 200);
+    return html(
+      renderAdminPage(site, siteConfig, authed, baseDomain),
+      200,
+      { "Cache-Control": PRIVATE_NO_CACHE_CONTROL }
+    );
   }
 
   if (path === "/") {
@@ -785,6 +790,23 @@ async function handleApi(request, env, ctx, context) {
       return json({ error: "Missing site context" }, 400);
     }
 
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const rateKey = `${clientIp}:${hostSlug}:change-password`;
+    const rateResult = await consumeRateLimit(
+      env,
+      rateKey,
+      15 * 60 * 1000,
+      6,
+      ctx
+    );
+    if (!rateResult.allowed) {
+      return json(
+        { error: "Too many password change attempts, please try later" },
+        429,
+        { "Retry-After": String(Math.ceil(rateResult.retryAfterMs / 1000)) }
+      );
+    }
+
     const site = await getSiteBySlug(env, hostSlug);
     if (!site) {
       return json({ error: "Site not found" }, 404);
@@ -818,6 +840,7 @@ async function handleApi(request, env, ctx, context) {
       .bind(nextHash, now, site.id)
       .run();
 
+    await clearRateLimit(env, rateKey);
     return json({ ok: true }, 200);
   }
 
@@ -1191,6 +1214,9 @@ async function handleApi(request, env, ctx, context) {
         { isPage: isPage === 1 }
       );
     } catch (error) {
+      if (error && error.status === 409) {
+        return json({ error: error.userMessage || "文章已被其他人修改，請重新載入後再儲存。" }, 409);
+      }
       console.error("Failed to save post", error);
       return json(
         {
@@ -2252,6 +2278,13 @@ async function githubWriteFile(env, filePath, content, message) {
 
   if (!response.ok) {
     const detail = await response.text();
+    if (response.status === 409) {
+      const conflictError = new Error("GitHub write conflict: resource changed by another editor");
+      conflictError.status = 409;
+      conflictError.userMessage = "文章已被其他人修改，請重新載入後再儲存。";
+      conflictError.detail = detail;
+      throw conflictError;
+    }
     throw new Error(`GitHub write failed: ${response.status} ${detail}`);
   }
 
@@ -3263,6 +3296,7 @@ function renderSiteHomePage(
 ) {
   const heading = siteConfig.heroTitle || site.displayName;
   const subtitle = siteConfig.heroSubtitle || site.description || "";
+  const siteUrl = `https://${site.slug}.${baseDomain}/`;
 
   const navLinks = (siteConfig.headerLinks || []).length
     ? `<nav class="site-nav">${siteConfig.headerLinks
@@ -3366,10 +3400,16 @@ function renderSiteHomePage(
       ? `<footer class="site-footer muted">${escapeHtml(siteConfig.footerNote)}</footer>`
       : ''}
     </section>
-  `,
+    `,
     siteConfig.colorTheme || 'default',
     siteConfig.customCss || "",
-    siteConfig.faviconUrl || DEFAULT_FAVICON_URL
+    siteConfig.faviconUrl || DEFAULT_FAVICON_URL,
+    {
+      title: site.displayName,
+      description: subtitle || site.description || `${site.displayName} 的部落格`,
+      type: "website",
+      url: siteUrl,
+    }
   );
 }
 
@@ -3384,6 +3424,8 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
   );
   const commentsTotal = Number(options.commentsTotal || comments.length || 0);
   const showCommunityPanel = !siteConfig.hideCommunitySites;
+  const canonicalPostUrl = `https://${site.slug}.${baseDomain}/${encodeURIComponent(post.postSlug)}`;
+  const previewPostUrl = `https://${site.slug}.${baseDomain}/preview/${encodeURIComponent(post.postSlug)}`;
 
   const peerSites = communitySites.length
     ? communitySites
@@ -3608,10 +3650,16 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
         }
       })();
     </script>
-  `,
+    `,
     siteConfig.colorTheme || "default",
     siteConfig.customCss || "",
-    siteConfig.faviconUrl || DEFAULT_FAVICON_URL
+    siteConfig.faviconUrl || DEFAULT_FAVICON_URL,
+    {
+      title: post.title,
+      description: post.description || site.description || `${site.displayName} 的文章`,
+      type: "article",
+      url: previewMode ? previewPostUrl : canonicalPostUrl,
+    }
   );
 }
 
@@ -4871,6 +4919,36 @@ function renderSimpleMessage(code, message) {
   );
 }
 
+function renderOgMetaTags(meta, fallbackTitle) {
+  const source = meta && typeof meta === "object" ? meta : {};
+  const safeTitle = sanitizeTitle(source.title || fallbackTitle || "").trim();
+  const safeDescription = sanitizeDescription(source.description || "").trim();
+  const safeType = String(source.type || "").toLowerCase() === "article" ? "article" : "website";
+  const safeUrl = sanitizeUrl(source.url || "");
+  const safeImage = sanitizeUrl(source.image || "");
+
+  const tags = [
+    `<meta property="og:title" content="${escapeHtml(safeTitle)}" />`,
+    `<meta property="og:type" content="${escapeHtml(safeType)}" />`,
+    `<meta name="twitter:card" content="summary" />`,
+    `<meta name="twitter:title" content="${escapeHtml(safeTitle)}" />`,
+  ];
+
+  if (safeDescription) {
+    tags.push(`<meta name="description" content="${escapeHtml(safeDescription)}" />`);
+    tags.push(`<meta property="og:description" content="${escapeHtml(safeDescription)}" />`);
+    tags.push(`<meta name="twitter:description" content="${escapeHtml(safeDescription)}" />`);
+  }
+  if (safeUrl) {
+    tags.push(`<meta property="og:url" content="${escapeHtml(safeUrl)}" />`);
+  }
+  if (safeImage) {
+    tags.push(`<meta property="og:image" content="${escapeHtml(safeImage)}" />`);
+    tags.push(`<meta name="twitter:image" content="${escapeHtml(safeImage)}" />`);
+  }
+  return tags.join("\n    ");
+}
+
 function renderThemeControlDock(mode = "front") {
   return `
   <section id="theme-dock" class="theme-dock" data-mode="${escapeHtml(mode)}">
@@ -4899,13 +4977,15 @@ function renderLayout(
   body,
   colorTheme = 'default',
   customCss = "",
-  faviconUrl = DEFAULT_FAVICON_URL
+  faviconUrl = DEFAULT_FAVICON_URL,
+  ogMeta = {}
 ) {
   const safeCustomCss = customCss
     ? `\n/* user custom css */\n${escapeStyleTagContent(customCss)}\n`
     : "";
   const normalizedFaviconUrl = sanitizeFaviconUrl(faviconUrl || DEFAULT_FAVICON_URL);
   const faviconMime = inferFaviconMimeType(normalizedFaviconUrl);
+  const ogMetaTags = renderOgMetaTags(ogMeta, title);
   return `<!doctype html>
 <html lang="zh-Hant">
   <head>
@@ -4917,6 +4997,7 @@ function renderLayout(
     <link rel="icon" href="${escapeHtml(normalizedFaviconUrl)}" type="${escapeHtml(faviconMime)}" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
     <title>${escapeHtml(title)}</title>
+    ${ogMetaTags}
     <style>
 :root {
   --bg-1: #f6f0e8;
@@ -5058,7 +5139,7 @@ button:active,.link-button:active{transform:translateY(0)}
 .admin-list{border-right:1px solid var(--line);padding-right:1rem;display:grid;gap:.5rem;align-content:start;min-width:0}
 .admin-list ul{list-style:none;margin:0;padding:0;display:grid;gap:.4rem;max-height:min(72vh,780px);overflow:auto;padding-right:.25rem}
 .danger-ghost{background:transparent;color:var(--muted);border-color:var(--line)}
-.danger-ghost:hover{color:#b7462c;border-color:#b7462c;transform:none}
+.danger-ghost:hover{color:var(--danger);border-color:var(--danger);transform:none}
 .settings-grid{display:grid;grid-template-columns:1fr 280px;gap:2rem}
 .settings-grid > *{min-width:0}
 .settings-form{display:grid;gap:.5rem;align-content:start}
