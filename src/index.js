@@ -34,6 +34,7 @@ const PASSWORD_SCRYPT_N = 1 << 14;
 const PASSWORD_SCRYPT_R = 8;
 const PASSWORD_SCRYPT_P = 1;
 const PASSWORD_SCRYPT_KEYLEN = 32;
+const CUSTOM_CSS_MAX_LENGTH = 64000;
 const PUBLIC_SSR_CACHE_CONTROL = "public, s-maxage=60, stale-while-revalidate=120";
 const PRIVATE_NO_CACHE_CONTROL = "private, no-cache";
 const REACTOR_COOKIE = "stublogs_reactor";
@@ -2369,14 +2370,27 @@ function buildReactionSnapshot(countsByKey = new Map(), selectedKeys = new Set()
   const normalizedSelected = new Set(
     Array.from(selectedKeys || []).map((item) => sanitizeReactionKey(item)).filter(Boolean)
   );
-  const items = REACTION_PRESETS.map((preset) => {
+  const items = REACTION_PRESETS.map((preset, index) => {
     const count = Math.max(Number(countsByKey.get(preset.key) || 0), 0);
     return {
       ...preset,
+      orderIndex: index,
       count,
       selected: normalizedSelected.has(preset.key),
     };
-  });
+  }).sort((left, right) => {
+    if (left.count !== right.count) {
+      return right.count - left.count;
+    }
+    return left.orderIndex - right.orderIndex;
+  }).map((item) => ({
+    key: item.key,
+    icon: item.icon,
+    label: item.label,
+    count: item.count,
+    selected: item.selected,
+  }));
+
   return {
     items,
     total: items.reduce((sum, item) => sum + item.count, 0),
@@ -3440,35 +3454,9 @@ function sanitizeDescription(value) {
 }
 
 function sanitizeCustomCss(value) {
-  const css = String(value || "")
+  return String(value || "")
     .replace(/\u0000/g, "")
-    .replace(/<\/style/gi, "")
-    .trim()
-    .slice(0, 8000);
-
-  const decoded = decodeCssEscapesForScan(css).toLowerCase();
-  if (
-    /@import\b/.test(decoded) ||
-    /expression\s*\(/.test(decoded) ||
-    /javascript\s*:/.test(decoded) ||
-    /behavior\s*:/.test(decoded)
-  ) {
-    return "";
-  }
-
-  return css;
-}
-
-function decodeCssEscapesForScan(input) {
-  return String(input || "")
-    .replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) => {
-      const codePoint = Number.parseInt(hex, 16);
-      if (!Number.isFinite(codePoint) || codePoint <= 0) {
-        return "";
-      }
-      return String.fromCodePoint(Math.min(codePoint, 0x10ffff));
-    })
-    .replace(/\\([^0-9a-fA-F])/g, "$1");
+    .slice(0, CUSTOM_CSS_MAX_LENGTH);
 }
 
 function sanitizeCommentAuthor(value) {
@@ -3535,7 +3523,7 @@ function html(body, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src https://fonts.gstatic.com https://cdn.jsdelivr.net data:; connect-src 'self'; img-src 'self' data: https:; frame-ancestors 'none'",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https:; font-src https: data:; connect-src 'self'; img-src 'self' data: https:; frame-ancestors 'none'",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
       "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -4594,8 +4582,8 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
             <label>頁尾文字</label>
             <input id="siteFooterNote" maxlength="240" />
             <label>自訂 CSS（前台）</label>
-            <textarea id="siteCustomCss" class="small-textarea" maxlength="8000" placeholder=".article-body h2 { letter-spacing: 0.02em; }"></textarea>
-            <p class="muted">僅作用於你的前台頁面（首頁與文章頁）。</p>
+            <textarea id="siteCustomCss" class="small-textarea" maxlength="64000" placeholder="@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&display=swap');"></textarea>
+            <p class="muted">僅作用於你的前台頁面（首頁與文章頁），支援 @import 與字體 CDN。</p>
             <label>外部連結（每行：標題|https://url）</label>
             <textarea id="siteHeaderLinks" class="small-textarea" placeholder="作品集|https://example.com"></textarea>
             <label class="inline-check">

@@ -151,3 +151,76 @@ test("post page renders reactions and view counter", () => {
   assert.match(html, /class="reaction-btn active"/);
   assert.match(html, /\/api\/reactions/);
 });
+
+test("post page reactions are sorted by count desc", () => {
+  const html = renderPostPage(
+    buildSite(),
+    buildSiteConfig(),
+    {
+      postSlug: "hello-world",
+      title: "Hello World",
+      description: "",
+      published: 1,
+      isPage: 0,
+      updatedAt: new Date().toISOString(),
+    },
+    "<p>content</p>",
+    [],
+    [{ postSlug: "home", title: "Home", updatedAt: "2026-02-21T00:00:00.000Z" }],
+    "bdfz.net",
+    {
+      commentsEnabled: true,
+      comments: [],
+      commentsTotal: 0,
+      commentsPage: 1,
+      commentsTotalPages: 1,
+      commentBasePath: "/hello-world",
+      reactionSnapshot: {
+        items: [
+          { key: "lion", count: 1 },
+          { key: "rocket", count: 5 },
+          { key: "dragon", count: 3 },
+        ],
+        selectedKeys: ["rocket"],
+      },
+    }
+  );
+
+  const rocketPos = html.indexOf('data-reaction-key="rocket"');
+  const dragonPos = html.indexOf('data-reaction-key="dragon"');
+  const lionPos = html.indexOf('data-reaction-key="lion"');
+  assert.ok(rocketPos > -1 && dragonPos > -1 && lionPos > -1);
+  assert.ok(rocketPos < dragonPos);
+  assert.ok(dragonPos < lionPos);
+});
+
+test("post page keeps custom css @import content", () => {
+  const config = buildSiteConfig();
+  config.customCss = "@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&display=swap');";
+  const html = renderPostPage(
+    buildSite(),
+    config,
+    {
+      postSlug: "hello-world",
+      title: "Hello World",
+      description: "",
+      published: 1,
+      isPage: 0,
+      updatedAt: new Date().toISOString(),
+    },
+    "<p>content</p>",
+    [],
+    [{ postSlug: "home", title: "Home", updatedAt: "2026-02-21T00:00:00.000Z" }],
+    "bdfz.net",
+    {
+      commentsEnabled: true,
+      comments: [],
+      commentsTotal: 0,
+      commentsPage: 1,
+      commentsTotalPages: 1,
+      commentBasePath: "/hello-world",
+    }
+  );
+
+  assert.match(html, /@import url\('https:\/\/fonts\.googleapis\.com/);
+});
