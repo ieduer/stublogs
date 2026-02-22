@@ -40,6 +40,7 @@ const PRIVATE_NO_CACHE_CONTROL = "private, no-cache";
 const REACTOR_COOKIE = "stublogs_reactor";
 const REACTOR_COOKIE_TTL_SECONDS = 60 * 60 * 24 * 365 * 2;
 const HOME_VIEW_KEY = "__home__";
+const NOTIFICATION_PAGE_SIZE = 40;
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
@@ -47,10 +48,13 @@ const COMMENT_RATE_WINDOW_MS = 60 * 1000;
 const COMMENT_RATE_MAX_ATTEMPTS = 6;
 const REACTION_RATE_WINDOW_MS = 60 * 1000;
 const REACTION_RATE_MAX_ATTEMPTS = 30;
+const VIEW_RATE_WINDOW_MS = 10 * 1000;
+const VIEW_RATE_MAX_ATTEMPTS = 2;
 let commentsTableReadyPromise = null;
 let rateLimitsTableReadyPromise = null;
 let reactionsTableReadyPromise = null;
 let viewsTableReadyPromise = null;
+let notificationTablesReadyPromise = null;
 const postsColumnsPromiseByDb = new WeakMap();
 
 const REACTION_PRESETS = Object.freeze([
@@ -308,7 +312,9 @@ async function handleRequest(request, env, ctx) {
     const siteConfig = await getSiteConfig(env, site);
     const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
     const [homeViewCount, postsPage, sitePages, communitySites, campusFeed] = await Promise.all([
-      incrementPageViewCount(env, site.id, "home", HOME_VIEW_KEY),
+      listPageViewCounts(env, site.id, "home", [HOME_VIEW_KEY]).then(
+        (map) => Math.max(Number(map.get(HOME_VIEW_KEY) || 0), 0)
+      ),
       listPostsPage(env, site.id, page, POSTS_PAGE_SIZE),
       listSitePages(env, site.id, 20),
       siteConfig.hideCommunitySites ? Promise.resolve([]) : listCommunitySites(env, site.slug, 12),
@@ -423,12 +429,14 @@ async function handleRequest(request, env, ctx) {
     listSitePages(env, site.id, 20),
   ]);
   const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
-  const reactor = resolveReactorToken(request);
+  const reactor = await resolveReactorToken(request, env);
   const [commentsData, postViewCount, reactionSnapshot] = await Promise.all([
     siteConfig.commentsEnabled
       ? listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
       : Promise.resolve({ comments: [], page: 1, totalPages: 1, total: 0 }),
-    incrementPageViewCount(env, site.id, "post", post.postSlug),
+    listPageViewCounts(env, site.id, "post", [post.postSlug]).then(
+      (map) => Math.max(Number(map.get(post.postSlug) || 0), 0)
+    ),
     listPostReactionSnapshot(env, site.id, post.postSlug, reactor.token),
   ]);
   const articleHtml = renderMarkdown(file.content);
@@ -969,6 +977,57 @@ async function handleApi(request, env, ctx, context) {
     );
   }
 
+  if (request.method === "POST" && path === "/api/view") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const body = await readJson(request);
+    const resourceType = normalizeViewResourceType(body.resourceType || body.type || "post");
+    const resourceKeyInput = String(body.resourceKey || body.postSlug || "").trim().toLowerCase();
+    const resourceKey = resourceType === "home" ? HOME_VIEW_KEY : resourceKeyInput;
+    if (!resourceKey) {
+      return json({ error: "Missing resource key" }, 400);
+    }
+    if (resourceType === "post") {
+      const post = await getPostMeta(env, site.id, resourceKey, false);
+      if (!post) {
+        return json({ error: "Post not found" }, 404);
+      }
+    }
+
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const viewRate = await consumeRateLimit(
+      env,
+      `${clientIp}:${site.slug}:view:${resourceType}:${resourceKey}`,
+      VIEW_RATE_WINDOW_MS,
+      VIEW_RATE_MAX_ATTEMPTS,
+      ctx
+    );
+    if (!viewRate.allowed) {
+      const viewMap = await listPageViewCounts(env, site.id, resourceType, [resourceKey]);
+      const currentCount = Math.max(Number(viewMap.get(resourceKey) || 0), 0);
+      return json(
+        { ok: true, throttled: true, count: currentCount },
+        200
+      );
+    }
+
+    const count = await incrementPageViewCount(env, site.id, resourceType, resourceKey);
+    return json(
+      {
+        ok: true,
+        resourceType,
+        resourceKey,
+        count,
+      },
+      200
+    );
+  }
+
   if (request.method === "GET" && path === "/api/admin/comments") {
     if (!hostSlug) {
       return json({ error: "Missing site context" }, 400);
@@ -1013,6 +1072,97 @@ async function handleApi(request, env, ctx, context) {
     );
   }
 
+  if (request.method === "GET" && path === "/api/admin/notify-settings") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+    const settings = await getSiteNotifySettings(env, site.id, { includeBotToken: false });
+    return json({ settings }, 200);
+  }
+
+  if (request.method === "POST" && path === "/api/admin/notify-settings") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const body = await readJson(request);
+    const settings = await upsertSiteNotifySettings(env, site.id, {
+      enabled: body.enabled,
+      notifyComments: body.notifyComments,
+      notifyReactions: body.notifyReactions,
+      telegramChatId: body.telegramChatId,
+      telegramBotToken: body.telegramBotToken,
+      clearBotToken: body.clearBotToken,
+    });
+    return json({ ok: true, settings }, 200);
+  }
+
+  if (request.method === "GET" && path === "/api/admin/notifications") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
+    const notificationsData = await listSiteNotifications(
+      env,
+      site.id,
+      page,
+      NOTIFICATION_PAGE_SIZE
+    );
+    return json(notificationsData, 200);
+  }
+
+  if (request.method === "POST" && path === "/api/admin/notifications/read") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const authed = await isSiteAuthenticated(request, env, site.slug);
+    if (!authed) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+
+    const body = await readJson(request);
+    await markSiteNotificationsRead(env, site.id, {
+      all: body.all === true,
+      ids: Array.isArray(body.ids) ? body.ids : [],
+    });
+    const notificationsData = await listSiteNotifications(
+      env,
+      site.id,
+      1,
+      NOTIFICATION_PAGE_SIZE
+    );
+    return json({ ok: true, unread: notificationsData.unread }, 200);
+  }
+
   if (request.method === "GET" && path === "/api/reactions") {
     if (!hostSlug) {
       return json({ error: "Missing site context" }, 400);
@@ -1029,7 +1179,7 @@ async function handleApi(request, env, ctx, context) {
     if (!post) {
       return json({ error: "Post not found" }, 404);
     }
-    const reactor = resolveReactorToken(request);
+    const reactor = await resolveReactorToken(request, env);
     const snapshot = await listPostReactionSnapshot(env, site.id, postSlug, reactor.token);
     let response = json(
       {
@@ -1092,8 +1242,21 @@ async function handleApi(request, env, ctx, context) {
       return json({ error: "Post not found" }, 404);
     }
 
-    const reactor = resolveReactorToken(request);
+    const reactor = await resolveReactorToken(request, env);
     const active = await togglePostReaction(env, site.id, postSlug, reactionKey, reactor.token);
+    if (active) {
+      const reactionPreset = REACTION_PRESET_MAP.get(reactionKey);
+      queueSiteNotificationEvent(env, ctx, site, {
+        eventType: "reaction",
+        postSlug,
+        postTitle: post.title || postSlug,
+        reactionKey,
+        reactionLabel: reactionPreset
+          ? `${reactionPreset.icon} ${reactionPreset.label}`
+          : reactionKey,
+        targetPath: `/${encodeURIComponent(postSlug)}#reactions`,
+      });
+    }
     const snapshot = await listPostReactionSnapshot(env, site.id, postSlug, reactor.token);
     let response = json(
       {
@@ -1207,6 +1370,16 @@ async function handleApi(request, env, ctx, context) {
     }
 
     const created = await createComment(env, site.id, postSlug, authorName, authorSite, content);
+    queueSiteNotificationEvent(env, ctx, site, {
+      eventType: "comment",
+      postSlug,
+      postTitle: post.title || postSlug,
+      actorName: created.authorName,
+      actorSiteSlug: created.authorSiteSlug,
+      contentPreview: created.content,
+      targetPath: `/${encodeURIComponent(postSlug)}#comments`,
+      createdAt: created.createdAt,
+    });
     return json({ ok: true, comment: created }, 201);
   }
 
@@ -1305,6 +1478,7 @@ async function handleApi(request, env, ctx, context) {
       );
       await deletePostMeta(env, site.id, post.postSlug);
       await deleteCommentsByPost(env, site.id, post.postSlug);
+      await deleteReactionsByPost(env, site.id, post.postSlug);
     } catch (error) {
       console.error("Failed to delete post", error);
       return json(
@@ -1391,6 +1565,7 @@ async function handleApi(request, env, ctx, context) {
         );
         await deletePostMeta(env, site.id, previousSlug);
         await moveCommentsToPost(env, site.id, previousSlug, postSlug);
+        await moveReactionsToPost(env, site.id, previousSlug, postSlug);
       }
 
       const createdAt = previousPost?.createdAt || existingPost?.createdAt || now;
@@ -1957,6 +2132,59 @@ async function ensureViewsTable(env) {
   return viewsTableReadyPromise;
 }
 
+async function ensureNotificationTables(env) {
+  if (!notificationTablesReadyPromise) {
+    notificationTablesReadyPromise = (async () => {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS site_notifications (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          site_id INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          post_slug TEXT NOT NULL,
+          post_title TEXT NOT NULL DEFAULT '',
+          actor_name TEXT NOT NULL DEFAULT '',
+          actor_site_slug TEXT NOT NULL DEFAULT '',
+          content_preview TEXT NOT NULL DEFAULT '',
+          reaction_key TEXT NOT NULL DEFAULT '',
+          reaction_label TEXT NOT NULL DEFAULT '',
+          target_path TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          read_at TEXT,
+          FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_site_notifications_site_created
+         ON site_notifications(site_id, created_at DESC)`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_site_notifications_site_read
+         ON site_notifications(site_id, read_at, created_at DESC)`
+      ).run();
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS site_telegram_settings (
+          site_id INTEGER PRIMARY KEY,
+          enabled INTEGER NOT NULL DEFAULT 0,
+          notify_comments INTEGER NOT NULL DEFAULT 1,
+          notify_reactions INTEGER NOT NULL DEFAULT 1,
+          telegram_chat_id TEXT NOT NULL DEFAULT '',
+          telegram_bot_token_enc TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_site_telegram_settings_updated
+         ON site_telegram_settings(updated_at DESC)`
+      ).run();
+    })().catch((error) => {
+      notificationTablesReadyPromise = null;
+      throw error;
+    });
+  }
+  return notificationTablesReadyPromise;
+}
+
 async function ensureRateLimitsTable(env) {
   if (!rateLimitsTableReadyPromise) {
     rateLimitsTableReadyPromise = (async () => {
@@ -2348,13 +2576,28 @@ function sanitizeActorToken(value) {
   return token.slice(0, 64);
 }
 
-function resolveReactorToken(request) {
+async function deriveIpActorToken(request, env) {
+  const ip = String(request.headers.get("cf-connecting-ip") || "").trim();
+  const ua = String(request.headers.get("user-agent") || "").trim();
+  if (!ip) {
+    return randomHex(16);
+  }
+  const digest = await sha256Hex(`${ip}|${ua}|${getSessionSecret(env)}|reactor-ip-v1`);
+  return sanitizeActorToken(digest) || randomHex(16);
+}
+
+async function resolveReactorToken(request, env) {
   const cookies = parseCookies(request.headers.get("cookie") || "");
   const existing = sanitizeActorToken(cookies[REACTOR_COOKIE]);
+  const ipToken = await deriveIpActorToken(request, env);
   if (existing) {
-    return { token: existing, shouldSetCookie: false };
+    if (existing === ipToken) {
+      return { token: ipToken, shouldSetCookie: false };
+    }
+    const mixed = await sha256Hex(`${existing}:${ipToken}:reactor-mix-v1`);
+    return { token: sanitizeActorToken(mixed) || ipToken, shouldSetCookie: false };
   }
-  return { token: randomHex(16), shouldSetCookie: true };
+  return { token: ipToken, shouldSetCookie: true };
 }
 
 function buildReactorCookie(token) {
@@ -2471,6 +2714,485 @@ async function togglePostReaction(env, siteId, postSlug, reactionKey, actorToken
     .bind(siteId, postSlug, normalizedReactionKey, normalizedActorToken, new Date().toISOString())
     .run();
   return true;
+}
+
+function sanitizeNotifyEventType(value) {
+  const type = String(value || "").trim().toLowerCase();
+  if (type === "comment") {
+    return "comment";
+  }
+  if (type === "reaction") {
+    return "reaction";
+  }
+  return "";
+}
+
+function sanitizeNotificationPath(value) {
+  const rawPath = String(value || "").trim();
+  if (!rawPath.startsWith("/")) {
+    return "/";
+  }
+  const path = rawPath
+    .replace(/[\u0000-\u001f\u007f"'<>`]/g, "")
+    .slice(0, 320);
+  return path.startsWith("/") ? path : "/";
+}
+
+function sanitizeNotificationPreview(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .slice(0, 320);
+}
+
+function sanitizeTelegramBotToken(value) {
+  const token = String(value || "").trim();
+  if (!token) {
+    return "";
+  }
+  if (!/^\d{6,14}:[A-Za-z0-9_-]{20,140}$/.test(token)) {
+    return "";
+  }
+  return token;
+}
+
+function sanitizeTelegramChatId(value) {
+  const chatId = String(value || "").trim();
+  if (!chatId) {
+    return "";
+  }
+  if (!/^-?\d{5,20}$/.test(chatId)) {
+    return "";
+  }
+  return chatId;
+}
+
+function normalizeNotifyBool(value, fallback = false) {
+  if (value === undefined || value === null) {
+    return Boolean(fallback);
+  }
+  return Boolean(value);
+}
+
+function defaultSiteNotifySettings() {
+  return {
+    enabled: false,
+    notifyComments: true,
+    notifyReactions: true,
+    telegramChatId: "",
+    hasBotToken: false,
+    telegramBotToken: "",
+    updatedAt: "",
+  };
+}
+
+async function getSiteNotifySettings(env, siteId, options = {}) {
+  await ensureNotificationTables(env);
+  const includeBotToken = Boolean(options.includeBotToken);
+  const row = await env.DB.prepare(
+    `SELECT
+      enabled,
+      notify_comments AS notifyComments,
+      notify_reactions AS notifyReactions,
+      telegram_chat_id AS telegramChatId,
+      telegram_bot_token_enc AS telegramBotTokenEnc,
+      updated_at AS updatedAt
+    FROM site_telegram_settings
+    WHERE site_id = ?
+    LIMIT 1`
+  )
+    .bind(siteId)
+    .first();
+
+  if (!row) {
+    return defaultSiteNotifySettings();
+  }
+
+  const encryptedToken = String(row.telegramBotTokenEnc || "");
+  let telegramBotToken = "";
+  if (includeBotToken && encryptedToken) {
+    try {
+      telegramBotToken = await decryptSensitiveValue(encryptedToken, env);
+    } catch (error) {
+      console.error("Failed to decrypt telegram bot token", error);
+      telegramBotToken = "";
+    }
+  }
+
+  return {
+    enabled: Number(row.enabled || 0) === 1,
+    notifyComments: Number(row.notifyComments || 0) !== 0,
+    notifyReactions: Number(row.notifyReactions || 0) !== 0,
+    telegramChatId: sanitizeTelegramChatId(row.telegramChatId || ""),
+    hasBotToken: Boolean(encryptedToken),
+    telegramBotToken: sanitizeTelegramBotToken(telegramBotToken),
+    updatedAt: String(row.updatedAt || ""),
+  };
+}
+
+async function upsertSiteNotifySettings(env, siteId, payload) {
+  await ensureNotificationTables(env);
+  const existing = await env.DB.prepare(
+    `SELECT telegram_bot_token_enc AS token
+     FROM site_telegram_settings
+     WHERE site_id = ?
+     LIMIT 1`
+  )
+    .bind(siteId)
+    .first();
+
+  const enabled = normalizeNotifyBool(payload.enabled, false);
+  const notifyComments = normalizeNotifyBool(payload.notifyComments, true);
+  const notifyReactions = normalizeNotifyBool(payload.notifyReactions, true);
+  const chatId = sanitizeTelegramChatId(payload.telegramChatId || "");
+  const rawToken = sanitizeTelegramBotToken(payload.telegramBotToken || "");
+  const clearBotToken = Boolean(payload.clearBotToken);
+
+  let tokenEnc = String(existing?.token || "");
+  if (rawToken) {
+    tokenEnc = await encryptSensitiveValue(rawToken, env);
+  } else if (clearBotToken) {
+    tokenEnc = "";
+  }
+
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO site_telegram_settings (
+      site_id,
+      enabled,
+      notify_comments,
+      notify_reactions,
+      telegram_chat_id,
+      telegram_bot_token_enc,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(site_id)
+    DO UPDATE SET
+      enabled = excluded.enabled,
+      notify_comments = excluded.notify_comments,
+      notify_reactions = excluded.notify_reactions,
+      telegram_chat_id = excluded.telegram_chat_id,
+      telegram_bot_token_enc = excluded.telegram_bot_token_enc,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      siteId,
+      enabled ? 1 : 0,
+      notifyComments ? 1 : 0,
+      notifyReactions ? 1 : 0,
+      chatId,
+      tokenEnc,
+      now
+    )
+    .run();
+
+  return getSiteNotifySettings(env, siteId, { includeBotToken: false });
+}
+
+async function createSiteNotification(env, siteId, payload) {
+  await ensureNotificationTables(env);
+  const eventType = sanitizeNotifyEventType(payload.eventType);
+  if (!eventType) {
+    return null;
+  }
+  const postSlug = String(payload.postSlug || "").trim().toLowerCase().slice(0, 120);
+  if (!postSlug) {
+    return null;
+  }
+
+  const now = String(payload.createdAt || new Date().toISOString());
+  const postTitle = sanitizeTitle(payload.postTitle || postSlug);
+  const actorName = sanitizeName(payload.actorName || "");
+  const actorSiteSlug = sanitizeOptionalSiteSlug(payload.actorSiteSlug || "");
+  const contentPreview = sanitizeNotificationPreview(payload.contentPreview || "");
+  const reactionKey = sanitizeReactionKey(payload.reactionKey || "");
+  const reactionPreset = reactionKey ? REACTION_PRESET_MAP.get(reactionKey) : null;
+  const reactionLabel = reactionPreset
+    ? `${reactionPreset.icon} ${reactionPreset.label}`
+    : sanitizeNotificationPreview(payload.reactionLabel || "");
+  const targetPath = sanitizeNotificationPath(payload.targetPath || `/${encodeURIComponent(postSlug)}`);
+
+  const result = await env.DB.prepare(
+    `INSERT INTO site_notifications (
+      site_id,
+      event_type,
+      post_slug,
+      post_title,
+      actor_name,
+      actor_site_slug,
+      content_preview,
+      reaction_key,
+      reaction_label,
+      target_path,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      siteId,
+      eventType,
+      postSlug,
+      postTitle,
+      actorName,
+      actorSiteSlug,
+      contentPreview,
+      reactionKey,
+      reactionLabel,
+      targetPath,
+      now
+    )
+    .run();
+
+  return Number(result.meta?.last_row_id || 0);
+}
+
+async function listSiteNotifications(env, siteId, page = 1, pageSize = NOTIFICATION_PAGE_SIZE) {
+  await ensureNotificationTables(env);
+  const safePageSize = Math.min(Math.max(Number(pageSize) || NOTIFICATION_PAGE_SIZE, 1), 100);
+  const safePage = Math.max(Number(page) || 1, 1);
+  const totalResult = await env.DB.prepare(
+    `SELECT COUNT(*) AS total
+     FROM site_notifications
+     WHERE site_id = ?`
+  )
+    .bind(siteId)
+    .first();
+  const unreadResult = await env.DB.prepare(
+    `SELECT COUNT(*) AS total
+     FROM site_notifications
+     WHERE site_id = ? AND read_at IS NULL`
+  )
+    .bind(siteId)
+    .first();
+
+  const total = Math.max(Number(totalResult?.total || 0), 0);
+  const unread = Math.max(Number(unreadResult?.total || 0), 0);
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const boundedPage = Math.min(safePage, totalPages);
+  const offset = (boundedPage - 1) * safePageSize;
+  const rows = await env.DB.prepare(
+    `SELECT
+      id,
+      event_type AS eventType,
+      post_slug AS postSlug,
+      post_title AS postTitle,
+      actor_name AS actorName,
+      actor_site_slug AS actorSiteSlug,
+      content_preview AS contentPreview,
+      reaction_key AS reactionKey,
+      reaction_label AS reactionLabel,
+      target_path AS targetPath,
+      created_at AS createdAt,
+      read_at AS readAt
+    FROM site_notifications
+    WHERE site_id = ?
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?`
+  )
+    .bind(siteId, safePageSize, offset)
+    .all();
+
+  const notifications = (rows.results || []).map((row) => ({
+    id: Number(row.id || 0),
+    eventType: sanitizeNotifyEventType(row.eventType),
+    postSlug: String(row.postSlug || ""),
+    postTitle: String(row.postTitle || ""),
+    actorName: String(row.actorName || ""),
+    actorSiteSlug: String(row.actorSiteSlug || ""),
+    contentPreview: String(row.contentPreview || ""),
+    reactionKey: sanitizeReactionKey(row.reactionKey),
+    reactionLabel: String(row.reactionLabel || ""),
+    targetPath: sanitizeNotificationPath(row.targetPath || "/"),
+    createdAt: String(row.createdAt || ""),
+    read: Boolean(row.readAt),
+  }));
+
+  return {
+    notifications,
+    unread,
+    total,
+    page: boundedPage,
+    pageSize: safePageSize,
+    totalPages,
+    hasPrev: boundedPage > 1,
+    hasNext: boundedPage < totalPages,
+  };
+}
+
+async function markSiteNotificationsRead(env, siteId, options = {}) {
+  await ensureNotificationTables(env);
+  const now = new Date().toISOString();
+  const markAll = Boolean(options.all);
+  if (markAll) {
+    await env.DB.prepare(
+      `UPDATE site_notifications
+       SET read_at = COALESCE(read_at, ?)
+       WHERE site_id = ?`
+    )
+      .bind(now, siteId)
+      .run();
+  } else {
+    const ids = Array.isArray(options.ids)
+      ? Array.from(
+        new Set(
+          options.ids
+            .map((item) => Number(item))
+            .filter((item) => Number.isInteger(item) && item > 0)
+            .slice(0, 80)
+        )
+      )
+      : [];
+    if (!ids.length) {
+      return;
+    }
+    const placeholders = ids.map(() => "?").join(",");
+    await env.DB.prepare(
+      `UPDATE site_notifications
+       SET read_at = COALESCE(read_at, ?)
+       WHERE site_id = ? AND id IN (${placeholders})`
+    )
+      .bind(now, siteId, ...ids)
+      .run();
+  }
+}
+
+function maybeScheduleNotificationsGc(env, siteId, ctx = null) {
+  if (Math.random() >= 0.02) {
+    return;
+  }
+  const cleanup = (async () => {
+    const cutoff = await env.DB.prepare(
+      `SELECT id
+       FROM site_notifications
+       WHERE site_id = ?
+       ORDER BY created_at DESC
+       LIMIT 1 OFFSET 799`
+    )
+      .bind(siteId)
+      .first();
+
+    const cutoffId = Number(cutoff?.id || 0);
+    if (!cutoffId) {
+      return;
+    }
+
+    await env.DB.prepare(
+      `DELETE FROM site_notifications
+       WHERE site_id = ? AND id < ?`
+    )
+      .bind(siteId, cutoffId)
+      .run();
+  })()
+    .catch((error) => {
+      console.error("Failed to cleanup old notifications", error);
+    });
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(cleanup);
+  }
+}
+
+function buildSiteNotificationMessage(event, site, baseDomain) {
+  const fullSite = `${site.slug}.${baseDomain}`;
+  const postUrl = `https://${fullSite}/${encodeURIComponent(event.postSlug)}`;
+  if (sanitizeNotifyEventType(event.eventType) === "reaction") {
+    const reactionLine = event.reactionLabel
+      ? `反應：${event.reactionLabel}`
+      : "反應：新點贊";
+    return [
+      "🔔 新點贊通知",
+      `站點：${fullSite}`,
+      `文章：${event.postTitle || event.postSlug}`,
+      reactionLine,
+      `連結：${postUrl}`,
+      `時間：${event.createdAt || new Date().toISOString()}`,
+    ].join("\n");
+  }
+  const actorLine = event.actorSiteSlug
+    ? `${event.actorName}（${event.actorSiteSlug}.${baseDomain}）`
+    : (event.actorName || "匿名");
+  return [
+    "💬 新留言通知",
+    `站點：${fullSite}`,
+    `文章：${event.postTitle || event.postSlug}`,
+    `留言者：${actorLine}`,
+    `內容：${event.contentPreview || "(無文字)"}`,
+    `連結：${postUrl}#comments`,
+    `時間：${event.createdAt || new Date().toISOString()}`,
+  ].join("\n");
+}
+
+async function sendTelegramViaCustomBot(botToken, chatId, text) {
+  const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true,
+      }),
+    });
+  } catch {
+    throw new Error("Telegram custom notify request failed");
+  }
+
+  if (!response.ok) {
+    throw new Error(`Telegram custom notify failed (${response.status})`);
+  }
+}
+
+function queueSiteNotificationEvent(env, ctx, site, payload) {
+  const task = (async () => {
+    const event = {
+      eventType: sanitizeNotifyEventType(payload.eventType),
+      postSlug: String(payload.postSlug || "").trim().toLowerCase(),
+      postTitle: sanitizeTitle(payload.postTitle || payload.postSlug || ""),
+      actorName: sanitizeName(payload.actorName || ""),
+      actorSiteSlug: sanitizeOptionalSiteSlug(payload.actorSiteSlug || ""),
+      contentPreview: sanitizeNotificationPreview(payload.contentPreview || ""),
+      reactionKey: sanitizeReactionKey(payload.reactionKey || ""),
+      reactionLabel: sanitizeNotificationPreview(payload.reactionLabel || ""),
+      targetPath: sanitizeNotificationPath(
+        payload.targetPath || `/${encodeURIComponent(String(payload.postSlug || "").trim().toLowerCase())}`
+      ),
+      createdAt: String(payload.createdAt || new Date().toISOString()),
+    };
+    if (!event.eventType || !event.postSlug) {
+      return;
+    }
+
+    await createSiteNotification(env, site.id, event);
+    maybeScheduleNotificationsGc(env, site.id, ctx);
+
+    const notifySettings = await getSiteNotifySettings(env, site.id, { includeBotToken: true });
+    if (!notifySettings.enabled || !notifySettings.telegramChatId || !notifySettings.telegramBotToken) {
+      return;
+    }
+    if (event.eventType === "comment" && !notifySettings.notifyComments) {
+      return;
+    }
+    if (event.eventType === "reaction" && !notifySettings.notifyReactions) {
+      return;
+    }
+    const baseDomain = String(env.BASE_DOMAIN || "bdfz.net").toLowerCase();
+    const message = buildSiteNotificationMessage(event, site, baseDomain);
+    await sendTelegramViaCustomBot(
+      notifySettings.telegramBotToken,
+      notifySettings.telegramChatId,
+      message
+    );
+  })().catch((error) => {
+    console.error("Failed to queue site notification event", error);
+  });
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(task);
+  }
 }
 
 async function getPostMeta(env, siteId, postSlug, includeDrafts = false) {
@@ -2661,6 +3383,26 @@ async function moveCommentsToPost(env, siteId, fromPostSlug, toPostSlug) {
   await ensureCommentsTable(env);
   await env.DB.prepare(
     `UPDATE comments
+     SET post_slug = ?
+     WHERE site_id = ? AND post_slug = ?`
+  )
+    .bind(toPostSlug, siteId, fromPostSlug)
+    .run();
+}
+
+async function deleteReactionsByPost(env, siteId, postSlug) {
+  await ensureReactionsTable(env);
+  await env.DB.prepare(
+    "DELETE FROM reactions WHERE site_id = ? AND post_slug = ?"
+  )
+    .bind(siteId, postSlug)
+    .run();
+}
+
+async function moveReactionsToPost(env, siteId, fromPostSlug, toPostSlug) {
+  await ensureReactionsTable(env);
+  await env.DB.prepare(
+    `UPDATE reactions
      SET post_slug = ?
      WHERE site_id = ? AND post_slug = ?`
   )
@@ -2983,21 +3725,25 @@ async function notifyTelegramNewSite(env, payload) {
   ];
 
   const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: lines.join("\n"),
-      disable_web_page_preview: true,
-    }),
-  });
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: lines.join("\n"),
+        disable_web_page_preview: true,
+      }),
+    });
+  } catch {
+    throw new Error("Telegram notify request failed");
+  }
 
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`Telegram notify failed: ${response.status} ${detail}`);
+    throw new Error(`Telegram notify failed (${response.status})`);
   }
 }
 
@@ -3263,6 +4009,77 @@ function randomHex(byteLength) {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
+function bytesToHex(bytes) {
+  return Array.from(bytes || [], (value) => Number(value).toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex) {
+  const raw = String(hex || "").trim().toLowerCase();
+  if (!raw || raw.length % 2 !== 0 || /[^0-9a-f]/.test(raw)) {
+    return null;
+  }
+  const bytes = new Uint8Array(raw.length / 2);
+  for (let index = 0; index < raw.length; index += 2) {
+    bytes[index / 2] = Number.parseInt(raw.slice(index, index + 2), 16);
+  }
+  return bytes;
+}
+
+async function getSensitiveCryptoKey(env) {
+  const secret = `${getSessionSecret(env)}:site-tele-notify:v1`;
+  const secretDigest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(secret)
+  );
+  return crypto.subtle.importKey(
+    "raw",
+    secretDigest,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptSensitiveValue(value, env) {
+  const plain = String(value || "");
+  if (!plain) {
+    return "";
+  }
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const key = await getSensitiveCryptoKey(env);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(plain)
+  );
+  return `v1$${bytesToHex(iv)}$${bytesToHex(new Uint8Array(encrypted))}`;
+}
+
+async function decryptSensitiveValue(value, env) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const parts = raw.split("$");
+  if (parts.length !== 3 || parts[0] !== "v1") {
+    return "";
+  }
+  const iv = hexToBytes(parts[1]);
+  const cipherBytes = hexToBytes(parts[2]);
+  if (!iv || !cipherBytes) {
+    return "";
+  }
+
+  const key = await getSensitiveCryptoKey(env);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv },
+    key,
+    cipherBytes
+  );
+  return new TextDecoder().decode(decrypted);
+}
+
 async function sha256Hex(value) {
   const encoded = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", encoded);
@@ -3523,7 +4340,7 @@ function html(body, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https:; font-src https: data:; connect-src 'self'; img-src 'self' data: https:; frame-ancestors 'none'",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https:; font-src https: data:; connect-src 'self'; img-src 'self' data: https:; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://player.bilibili.com https://open.spotify.com https://twitframe.com https://www.instagram.com; media-src https: data:; frame-ancestors 'none'",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
       "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -3889,7 +4706,7 @@ function renderSiteHomePage(
           <p class="eyebrow">${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
           <h1>${escapeHtml(heading)}</h1>
           <p class="muted">${escapeHtml(subtitle)}</p>
-          <p class="muted">首頁訪問：${escapeHtml(formatViewCount(homeViewCount))}</p>
+          <p class="muted">首頁訪問：<span id="home-view-count">${escapeHtml(formatViewCount(homeViewCount))}</span></p>
         </div>
         <div class="row-actions">
           <a class="link-button" href="/admin">Admin</a>
@@ -3919,6 +4736,36 @@ function renderSiteHomePage(
       ? `<footer class="site-footer muted">${escapeHtml(siteConfig.footerNote)}</footer>`
       : ''}
     </section>
+    <script>
+      (function () {
+        const viewEl = document.getElementById('home-view-count');
+        const dedupeKey = 'stublogs-view:' + location.host + ':home';
+        try {
+          if (sessionStorage.getItem(dedupeKey)) {
+            return;
+          }
+          sessionStorage.setItem(dedupeKey, '1');
+        } catch {
+          // ignore
+        }
+        fetch('/api/view', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resourceType: 'home', resourceKey: '${HOME_VIEW_KEY}' }),
+        })
+          .then((response) => (response.ok ? response.json() : null))
+          .then((payload) => {
+            if (!payload || typeof payload.count !== 'number' || !viewEl) {
+              return;
+            }
+            const next = Math.max(Number(payload.count || 0), 0);
+            viewEl.textContent = new Intl.NumberFormat('zh-Hant').format(next);
+          })
+          .catch(() => {
+            // ignore view beacon failures
+          });
+      })();
+    </script>
     `,
     siteConfig.colorTheme || 'default',
     siteConfig.customCss || "",
@@ -4114,7 +4961,7 @@ export function renderPostPage(
       site.slug
     )}.${escapeHtml(baseDomain)} ${Number(post.isPage) === 1 ? '<span class="preview-badge">Page</span>' : ''} ${previewMode ? '<span class="preview-badge">Preview</span>' : ''}</p>
         <h1>${escapeHtml(post.title)}</h1>
-        <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span> <span class="read-time">· 訪問 ${escapeHtml(formatViewCount(postViewCount))}</span></p>
+        <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span> <span class="read-time">· 訪問 <span id="post-view-count">${escapeHtml(formatViewCount(postViewCount))}</span></span></p>
         ${renderThemeControlDock("front")}
         ${modeNav}
         <div class="article-body">${articleHtml}</div>
@@ -4149,6 +4996,39 @@ export function renderPostPage(
       (function() {
         const progress = document.getElementById('reading-progress');
         const backTop = document.getElementById('back-top');
+        const postViewEl = document.getElementById('post-view-count');
+        const canTrackView = ${previewMode ? "false" : "true"};
+        if (canTrackView) {
+          const dedupeKey = 'stublogs-view:' + location.host + ':post:' + ${JSON.stringify(post.postSlug)};
+          let shouldSend = true;
+          try {
+            if (sessionStorage.getItem(dedupeKey)) {
+              shouldSend = false;
+            } else {
+              sessionStorage.setItem(dedupeKey, '1');
+            }
+          } catch {
+            // ignore
+          }
+          if (shouldSend) {
+            fetch('/api/view', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ resourceType: 'post', resourceKey: ${JSON.stringify(post.postSlug)} }),
+            })
+              .then((response) => (response.ok ? response.json() : null))
+              .then((payload) => {
+                if (!payload || typeof payload.count !== 'number' || !postViewEl) {
+                  return;
+                }
+                const next = Math.max(Number(payload.count || 0), 0);
+                postViewEl.textContent = new Intl.NumberFormat('zh-Hant').format(next);
+              })
+              .catch(() => {
+                // ignore view beacon failures
+              });
+          }
+        }
         function onScroll() {
           const scrollTop = window.scrollY;
           const docHeight = document.documentElement.scrollHeight - window.innerHeight;
@@ -4476,6 +5356,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
       <nav class="admin-tabs">
         <button id="tab-posts" class="admin-tab active" type="button">✏️ Posts</button>
+        <button id="tab-notifications" class="admin-tab" type="button">🔔 通知 <span id="notify-tab-badge" class="tab-badge">0</span></button>
         <button id="tab-settings" class="admin-tab" type="button">⚙️ Settings</button>
       </nav>
 
@@ -4513,6 +5394,11 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
               <button type="button" data-md="h3" title="Heading 3">H3</button>
               <button type="button" data-md="link" title="Link">🔗</button>
               <button type="button" data-md="image" title="Image">🖼</button>
+              <button type="button" data-md="youtube" title="YouTube">▶︎YT</button>
+              <button type="button" data-md="bilibili" title="Bilibili">▶︎B站</button>
+              <button type="button" data-md="spotify" title="Spotify">♫SP</button>
+              <button type="button" data-md="x" title="X / Twitter">𝕏</button>
+              <button type="button" data-md="instagram" title="Instagram">◎INS</button>
               <button type="button" data-md="list" title="List">•</button>
               <button type="button" data-md="task" title="Task list">☑︎</button>
               <button type="button" data-md="ordered" title="Ordered list">1.</button>
@@ -4598,6 +5484,28 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
               <input id="siteCommentsEnabled" type="checkbox" />
               啟用文章留言
             </label>
+            <h3>通知設定</h3>
+            <label class="inline-check">
+              <input id="notifyEnabled" type="checkbox" />
+              啟用 Telegram 即時通知
+            </label>
+            <label class="inline-check">
+              <input id="notifyComments" type="checkbox" />
+              留言通知
+            </label>
+            <label class="inline-check">
+              <input id="notifyReactions" type="checkbox" />
+              點贊通知
+            </label>
+            <label>Telegram Bot Token（選填）</label>
+            <input id="notifyTelegramBotToken" type="password" maxlength="200" placeholder="123456789:AA..." />
+            <label>Telegram Chat ID（選填）</label>
+            <input id="notifyTelegramChatId" maxlength="24" placeholder="5016203472 或 -100xxxxxxxxxx" />
+            <label class="inline-check">
+              <input id="notifyClearBotToken" type="checkbox" />
+              清除已儲存 Bot Token
+            </label>
+            <p id="notify-settings-hint" class="muted">Bot Token 僅保存在平台資料庫，不會寫入 GitHub 倉庫。</p>
             <button id="save-settings" type="button">儲存站點設定</button>
             <p id="settings-status" class="muted"></p>
             <h3>修改密碼</h3>
@@ -4619,6 +5527,18 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
           </aside>
         </div>
       </div>
+
+      <!-- ═══ NOTIFICATIONS TAB ═══ -->
+      <div id="panel-notifications" class="admin-panel" style="display:none">
+        <section class="notification-panel">
+          <div class="row-actions">
+            <button id="refresh-notifications" type="button">重新整理</button>
+            <button id="mark-all-notifications-read" type="button" class="link-button">全部標為已讀</button>
+          </div>
+          <ul id="notification-list" class="notification-list"></ul>
+          <p id="notification-status" class="muted"></p>
+        </section>
+      </div>
     </section>
 
     <script>
@@ -4627,9 +5547,18 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
         currentSlug: '',
         posts: [],
         comments: [],
+        notifications: [],
         postFilter: '',
         keepEditorSelection: false,
         siteConfig: initialConfig,
+        notifySettings: {
+          enabled: false,
+          notifyComments: true,
+          notifyReactions: true,
+          telegramChatId: '',
+          hasBotToken: false,
+        },
+        notificationUnread: 0,
       };
 
       const postList = document.getElementById('post-list');
@@ -4647,10 +5576,22 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
       const siteHideCommunitySitesInput = document.getElementById('siteHideCommunitySites');
       const siteHideCampusFeedInput = document.getElementById('siteHideCampusFeed');
       const siteCommentsEnabledInput = document.getElementById('siteCommentsEnabled');
+      const notifyEnabledInput = document.getElementById('notifyEnabled');
+      const notifyCommentsInput = document.getElementById('notifyComments');
+      const notifyReactionsInput = document.getElementById('notifyReactions');
+      const notifyTelegramBotTokenInput = document.getElementById('notifyTelegramBotToken');
+      const notifyTelegramChatIdInput = document.getElementById('notifyTelegramChatId');
+      const notifyClearBotTokenInput = document.getElementById('notifyClearBotToken');
+      const notifySettingsHintEl = document.getElementById('notify-settings-hint');
       const currentPasswordInput = document.getElementById('currentPassword');
       const newPasswordInput = document.getElementById('newPassword');
       const confirmNewPasswordInput = document.getElementById('confirmNewPassword');
       const passwordStatusEl = document.getElementById('password-status');
+      const notificationListEl = document.getElementById('notification-list');
+      const notificationStatusEl = document.getElementById('notification-status');
+      const notificationBadgeEl = document.getElementById('notify-tab-badge');
+      const markAllNotificationsReadBtn = document.getElementById('mark-all-notifications-read');
+      const refreshNotificationsBtn = document.getElementById('refresh-notifications');
       const titleInput = document.getElementById('title');
       const postSlugInput = document.getElementById('postSlug');
       const descriptionInput = document.getElementById('description');
@@ -4690,6 +5631,129 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
         }
         passwordStatusEl.textContent = message;
         passwordStatusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+      }
+
+      function setNotificationStatus(message, isError = false) {
+        if (!notificationStatusEl) {
+          return;
+        }
+        notificationStatusEl.textContent = message;
+        notificationStatusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+      }
+
+      function updateNotificationBadge() {
+        if (!notificationBadgeEl) {
+          return;
+        }
+        const unread = Math.max(Number(state.notificationUnread || 0), 0);
+        notificationBadgeEl.textContent = String(unread);
+        notificationBadgeEl.classList.toggle('has-unread', unread > 0);
+      }
+
+      function syncNotifyInputsState() {
+        if (!notifyEnabledInput) {
+          return;
+        }
+        const disabled = !notifyEnabledInput.checked;
+        if (notifyCommentsInput) notifyCommentsInput.disabled = disabled;
+        if (notifyReactionsInput) notifyReactionsInput.disabled = disabled;
+        if (notifyTelegramBotTokenInput) notifyTelegramBotTokenInput.disabled = disabled;
+        if (notifyTelegramChatIdInput) notifyTelegramChatIdInput.disabled = disabled;
+        if (notifyClearBotTokenInput) notifyClearBotTokenInput.disabled = disabled;
+      }
+
+      function applyNotifySettingsToForm(settings) {
+        const safe = settings || {};
+        state.notifySettings = {
+          enabled: !!safe.enabled,
+          notifyComments: safe.notifyComments !== false,
+          notifyReactions: safe.notifyReactions !== false,
+          telegramChatId: safe.telegramChatId || '',
+          hasBotToken: !!safe.hasBotToken,
+        };
+        if (notifyEnabledInput) notifyEnabledInput.checked = state.notifySettings.enabled;
+        if (notifyCommentsInput) notifyCommentsInput.checked = state.notifySettings.notifyComments;
+        if (notifyReactionsInput) notifyReactionsInput.checked = state.notifySettings.notifyReactions;
+        if (notifyTelegramChatIdInput) notifyTelegramChatIdInput.value = state.notifySettings.telegramChatId || '';
+        if (notifyTelegramBotTokenInput) notifyTelegramBotTokenInput.value = '';
+        if (notifyClearBotTokenInput) notifyClearBotTokenInput.checked = false;
+        if (notifySettingsHintEl) {
+          notifySettingsHintEl.textContent = state.notifySettings.hasBotToken
+            ? '已儲存 Telegram Bot Token（留空表示保持不變）。'
+            : '尚未儲存 Telegram Bot Token（可選填）。';
+        }
+        syncNotifyInputsState();
+      }
+
+      function renderNotificationList() {
+        if (!notificationListEl) {
+          return;
+        }
+        if (!state.notifications.length) {
+          notificationListEl.innerHTML = '<li class="muted">目前沒有通知。</li>';
+          return;
+        }
+        notificationListEl.innerHTML = state.notifications
+          .map((item) => {
+            const safeTitle = escapeText(item.postTitle || item.postSlug || 'untitled');
+            const safePath = String(item.targetPath || '/');
+            const safeHref = escapeText(safePath);
+            const safeContent = escapeText(item.contentPreview || '').replace(/\n/g, '<br />');
+            const safeTime = item.createdAt ? escapeText(new Date(item.createdAt).toLocaleString('zh-Hant')) : '';
+            const safeActor = item.actorName ? (' · ' + escapeText(item.actorName)) : '';
+            const kind = item.eventType === 'reaction'
+              ? '點贊'
+              : (item.eventType === 'comment' ? '留言' : '通知');
+            const reactionLine = item.eventType === 'reaction' && item.reactionLabel
+              ? ('<p class="muted">' + escapeText(item.reactionLabel) + '</p>')
+              : '';
+            const unreadClass = item.read ? '' : ' unread';
+            return '<li class="notification-item' + unreadClass + '" data-id="' + item.id + '">' +
+              '<div class="notification-head">' +
+                '<span class="notification-kind">' + kind + safeActor + '</span>' +
+                '<time>' + safeTime + '</time>' +
+              '</div>' +
+              '<p><a href="' + safeHref + '" target="_blank" rel="noreferrer noopener">' + safeTitle + '</a></p>' +
+              (safeContent ? ('<p class="notification-content">' + safeContent + '</p>') : '') +
+              reactionLine +
+              '<div class="row-actions">' +
+                '<button type="button" class="link-button small ghost notification-read-btn" data-id="' + item.id + '">標為已讀</button>' +
+              '</div>' +
+            '</li>';
+          })
+          .join('');
+      }
+
+      async function refreshNotifySettings() {
+        const payload = await fetchJson('/api/admin/notify-settings');
+        applyNotifySettingsToForm(payload.settings || {});
+      }
+
+      async function refreshNotifications(options = {}) {
+        const silent = !!options.silent;
+        if (!silent) {
+          setNotificationStatus('載入通知中...');
+        }
+        const payload = await fetchJson('/api/admin/notifications?page=1');
+        state.notifications = Array.isArray(payload.notifications) ? payload.notifications : [];
+        state.notificationUnread = Math.max(Number(payload.unread || 0), 0);
+        renderNotificationList();
+        updateNotificationBadge();
+        if (!silent) {
+          setNotificationStatus('通知已更新');
+        }
+      }
+
+      async function markNotificationsRead(options = {}) {
+        const all = !!options.all;
+        const ids = Array.isArray(options.ids) ? options.ids : [];
+        const payload = await fetchJson('/api/admin/notifications/read', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ all, ids }),
+        });
+        state.notificationUnread = Math.max(Number(payload.unread || 0), 0);
+        updateNotificationBadge();
       }
 
       function toSlug(value, withFallback = false) {
@@ -5140,6 +6204,27 @@ async function saveSiteSettings() {
   if (savingSettings) {
     return;
   }
+  const notifyTokenValue = notifyTelegramBotTokenInput ? notifyTelegramBotTokenInput.value.trim() : '';
+  const notifyChatIdValue = notifyTelegramChatIdInput ? notifyTelegramChatIdInput.value.trim() : '';
+  const clearNotifyToken = notifyClearBotTokenInput ? notifyClearBotTokenInput.checked : false;
+  const notifyEnabled = notifyEnabledInput ? notifyEnabledInput.checked : false;
+  if (notifyTokenValue && !/^\d{6,14}:[A-Za-z0-9_-]{20,140}$/.test(notifyTokenValue)) {
+    setSettingsStatus('Telegram Bot Token 格式不正確', true);
+    return;
+  }
+  if (notifyChatIdValue && !/^-?\d{5,20}$/.test(notifyChatIdValue)) {
+    setSettingsStatus('Telegram Chat ID 格式不正確', true);
+    return;
+  }
+  const hasTokenAfterSave = Boolean(notifyTokenValue || (state.notifySettings.hasBotToken && !clearNotifyToken));
+  if (
+    notifyEnabled &&
+    (!notifyChatIdValue || !hasTokenAfterSave)
+  ) {
+    setSettingsStatus('啟用通知時，請填寫 Telegram Chat ID 與 Bot Token', true);
+    return;
+  }
+
   savingSettings = true;
   setSettingsStatus('儲存設定中...');
   if (saveSettingsBtn) {
@@ -5165,15 +6250,28 @@ async function saveSiteSettings() {
         commentsEnabled: siteCommentsEnabledInput.checked,
       }),
     });
+    const notifyPayload = await fetchJson('/api/admin/notify-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: notifyEnabledInput ? notifyEnabledInput.checked : false,
+        notifyComments: notifyCommentsInput ? notifyCommentsInput.checked : true,
+        notifyReactions: notifyReactionsInput ? notifyReactionsInput.checked : true,
+        telegramChatId: notifyChatIdValue,
+        telegramBotToken: notifyTokenValue,
+        clearBotToken: clearNotifyToken,
+      }),
+    });
 
     state.siteConfig = payload.config || state.siteConfig;
     applySettingsToForm(state.siteConfig);
+    applyNotifySettingsToForm(notifyPayload.settings || {});
     if (typeof window.__applyThemeDockTheme === 'function') {
       window.__applyThemeDockTheme(state.siteConfig.colorTheme || 'default');
     } else {
       document.body.className = "theme-" + (state.siteConfig.colorTheme || "default");
     }
-    setSettingsStatus('站點設定已儲存');
+    setSettingsStatus('站點與通知設定已儲存');
   } catch (error) {
     setSettingsStatus(error.message || '儲存站點設定失敗', true);
   } finally {
@@ -5370,6 +6468,11 @@ if (isPageInput) {
     updateSaveBtn();
   });
 }
+if (notifyEnabledInput) {
+  notifyEnabledInput.addEventListener('change', () => {
+    syncNotifyInputsState();
+  });
+}
 updateSaveBtn();
 
 document.addEventListener('keydown', (event) => {
@@ -5392,31 +6495,103 @@ window.addEventListener('beforeunload', (event) => {
 });
 
 applySettingsToForm(initialConfig);
+syncNotifyInputsState();
 resetEditor({ restoreDraft: true, keepEditorSelection: false });
 refreshSettings().catch((error) => {
   setSettingsStatus(error.message || 'Failed to load site settings', true);
 });
+refreshNotifySettings().catch((error) => {
+  setSettingsStatus(error.message || 'Failed to load notification settings', true);
+});
 refreshPosts().catch((error) => {
   setStatus(error.message || 'Failed to load posts', true);
 });
+refreshNotifications({ silent: true }).catch((error) => {
+  setNotificationStatus(error.message || '通知載入失敗', true);
+});
+setInterval(() => {
+  refreshNotifications({ silent: true }).catch(() => {
+    // Ignore transient polling failures.
+  });
+}, 30000);
 
 // ── Tab switching ──
 const tabPosts = document.getElementById('tab-posts');
+const tabNotifications = document.getElementById('tab-notifications');
 const tabSettings = document.getElementById('tab-settings');
 const panelPosts = document.getElementById('panel-posts');
+const panelNotifications = document.getElementById('panel-notifications');
 const panelSettings = document.getElementById('panel-settings');
-if (tabPosts && tabSettings) {
+if (tabPosts && tabNotifications && tabSettings) {
   tabPosts.addEventListener('click', () => {
     tabPosts.classList.add('active');
+    tabNotifications.classList.remove('active');
     tabSettings.classList.remove('active');
     panelPosts.style.display = '';
+    panelNotifications.style.display = 'none';
     panelSettings.style.display = 'none';
+  });
+  tabNotifications.addEventListener('click', () => {
+    tabNotifications.classList.add('active');
+    tabPosts.classList.remove('active');
+    tabSettings.classList.remove('active');
+    panelNotifications.style.display = '';
+    panelPosts.style.display = 'none';
+    panelSettings.style.display = 'none';
+    refreshNotifications().catch((error) => {
+      setNotificationStatus(error.message || '通知載入失敗', true);
+    });
   });
   tabSettings.addEventListener('click', () => {
     tabSettings.classList.add('active');
+    tabNotifications.classList.remove('active');
     tabPosts.classList.remove('active');
+    panelNotifications.style.display = 'none';
     panelSettings.style.display = '';
     panelPosts.style.display = 'none';
+  });
+}
+
+if (markAllNotificationsReadBtn) {
+  markAllNotificationsReadBtn.addEventListener('click', async () => {
+    setNotificationStatus('更新已讀狀態中...');
+    try {
+      await markNotificationsRead({ all: true });
+      await refreshNotifications({ silent: true });
+      setNotificationStatus('已全部標為已讀');
+    } catch (error) {
+      setNotificationStatus(error.message || '更新通知失敗', true);
+    }
+  });
+}
+if (refreshNotificationsBtn) {
+  refreshNotificationsBtn.addEventListener('click', () => {
+    refreshNotifications().catch((error) => {
+      setNotificationStatus(error.message || '通知載入失敗', true);
+    });
+  });
+}
+if (notificationListEl) {
+  notificationListEl.addEventListener('click', async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const readButton = target.closest('.notification-read-btn[data-id]');
+    if (!readButton) {
+      return;
+    }
+    const id = Number(readButton.getAttribute('data-id'));
+    if (!Number.isInteger(id) || id <= 0) {
+      return;
+    }
+    try {
+      await markNotificationsRead({ ids: [id] });
+      await refreshNotifications({ silent: true });
+      setNotificationStatus('通知已標為已讀');
+    } catch (error) {
+      setNotificationStatus(error.message || '操作失敗', true);
+    }
   });
 }
 
@@ -5468,6 +6643,21 @@ function insertMd(type) {
       break;
     case 'image':
       replacement = '![' + (sel || '圖片描述') + '](https://)';
+      break;
+    case 'youtube':
+      replacement = (sel || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+      break;
+    case 'bilibili':
+      replacement = (sel || 'https://www.bilibili.com/video/BV1xx411c7mD/');
+      break;
+    case 'spotify':
+      replacement = (sel || 'https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl');
+      break;
+    case 'x':
+      replacement = (sel || 'https://x.com/jack/status/20');
+      break;
+    case 'instagram':
+      replacement = (sel || 'https://www.instagram.com/p/CxXn-example/');
       break;
     case 'list':
       replacement = mapLines((line) => '- ' + (line || '列表項'), '列表項');
@@ -5845,6 +7035,12 @@ button:active,.link-button:active{transform:translateY(0)}
 .article-body .task-label input[type="checkbox"]{margin-top:.25rem;accent-color:var(--accent)}
 .article-body del{opacity:.75}
 .article-body img{max-width:100%;border-radius:8px;margin:.8rem 0}
+.article-body .embed-block{margin:1rem 0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--code-bg)}
+.article-body .embed-block iframe{display:block;width:100%;border:0;min-height:320px;background:rgba(0,0,0,.08)}
+.article-body .embed-block.embed-spotify iframe{min-height:232px}
+.article-body .embed-block.embed-instagram iframe{min-height:560px}
+.article-body .embed-block.embed-x iframe{min-height:480px}
+.article-body .embed-caption{padding:.45rem .65rem;border-top:1px solid var(--line);font-family:var(--font-mono);font-size:.75rem;color:var(--muted)}
 .article-wrap{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:1.2rem}
 .article-side{border-left:1px solid var(--line);padding-left:.9rem}
 .article-body pre{background:rgba(30,28,24,.96);color:#e8e4dc;padding:1rem;border-radius:10px;overflow-x:auto;font-size:.88rem;line-height:1.5;margin:.8rem 0}
@@ -5883,6 +7079,8 @@ button:active,.link-button:active{transform:translateY(0)}
 .admin-tab{background:transparent;color:var(--muted);border:none;border-bottom:2px solid transparent;border-radius:0;padding:.6rem 1.2rem;font-family:var(--font-mono);font-size:.85rem;margin-bottom:-2px;transition:all .2s}
 .admin-tab:hover{color:var(--ink);transform:none}
 .admin-tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+.tab-badge{display:inline-flex;align-items:center;justify-content:center;min-width:1.25rem;padding:0 .35rem;height:1.25rem;border-radius:999px;border:1px solid var(--line);font-size:.72rem;margin-left:.35rem;color:var(--muted);background:transparent}
+.tab-badge.has-unread{background:var(--accent);border-color:var(--accent);color:#fff}
 .admin-panel{margin-top:1rem}
 .admin-grid{display:grid;grid-template-columns:220px minmax(0,1fr);gap:1.5rem}
 .admin-list{border-right:1px solid var(--line);padding-right:1rem;display:grid;gap:.5rem;align-content:start;min-width:0}
@@ -5912,6 +7110,18 @@ button:active,.link-button:active{transform:translateY(0)}
 .inline-check{display:inline-flex;align-items:center;gap:.5rem;margin:.4rem 0}
 .inline-check input[type="checkbox"]{width:18px;height:18px;accent-color:var(--accent)}
 .comment-admin-panel{margin-top:.8rem;display:grid;gap:.5rem}
+.notification-panel{display:grid;gap:.75rem}
+.notification-list{list-style:none;margin:0;padding:0;display:grid;gap:.65rem}
+.notification-item{border:1px solid var(--line);border-radius:10px;padding:.7rem .8rem;background:rgba(255,255,255,.45);display:grid;gap:.35rem}
+@media(prefers-color-scheme:dark){.notification-item{background:rgba(255,255,255,.03)}}
+.notification-item.unread{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-glow) inset}
+.notification-head{display:flex;align-items:center;justify-content:space-between;gap:.6rem}
+.notification-kind{font-family:var(--font-mono);font-size:.78rem;color:var(--ink-2)}
+.notification-head time{font-family:var(--font-mono);font-size:.74rem;color:var(--muted)}
+.notification-content{color:var(--muted);font-size:.9rem}
+.link-button.small,.notification-read-btn{min-height:34px;padding:.35rem .6rem;font-size:.8rem}
+.link-button.ghost,.notification-read-btn{background:transparent;color:var(--muted);border-color:var(--line)}
+.link-button.ghost:hover,.notification-read-btn:hover{color:var(--accent);border-color:var(--accent)}
 a{color:var(--accent)}
 code{font-family:var(--font-mono)}
 /* fullscreen overlay */
@@ -5935,6 +7145,9 @@ code{font-family:var(--font-mono)}
   .community-panel{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:.9rem}
   .article-wrap{grid-template-columns:1fr}
   .article-side{border-left:0;border-top:1px solid var(--line);padding-left:0;padding-top:.8rem}
+  .article-body .embed-block iframe{min-height:240px}
+  .article-body .embed-block.embed-instagram iframe{min-height:420px}
+  .article-body .embed-block.embed-x iframe{min-height:360px}
   .theme-dock{display:grid;grid-template-columns:1fr;gap:.4rem}
   .theme-dock select{width:100%}
   input,textarea,button,.link-button{font-size:16px;min-height:44px}
@@ -6252,6 +7465,19 @@ export function renderMarkdown(source) {
       continue;
     }
 
+    const embedUrl = extractStandaloneEmbedUrl(line);
+    if (embedUrl) {
+      const embedHtml = renderEmbedBlockFromUrl(embedUrl);
+      if (embedHtml) {
+        flushParagraph();
+        flushBulletList();
+        flushOrderedList();
+        flushQuote();
+        blocks.push(embedHtml);
+        continue;
+      }
+    }
+
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       flushParagraph();
@@ -6360,6 +7586,244 @@ function renderNestedListHtml(items, listTag, renderItemContent) {
   };
 
   return renderNodes(roots);
+}
+
+function extractStandaloneEmbedUrl(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (/^https?:\/\/\S+$/i.test(trimmed)) {
+    return trimmed;
+  }
+  const angle = trimmed.match(/^<\s*(https?:\/\/[^>\s]+)\s*>$/i);
+  if (angle) {
+    return angle[1];
+  }
+  const markdownLink = trimmed.match(/^\[[^\]]+\]\((https?:\/\/[^)\s]+)\)$/i);
+  if (markdownLink) {
+    return markdownLink[1];
+  }
+  return "";
+}
+
+function parseDurationToSeconds(raw) {
+  const text = String(raw || "").trim().toLowerCase();
+  if (!text) {
+    return 0;
+  }
+  if (/^\d+$/.test(text)) {
+    return Math.max(Number(text), 0);
+  }
+  const match = text.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/);
+  if (!match) {
+    return 0;
+  }
+  const hours = Number(match[1] || 0);
+  const minutes = Number(match[2] || 0);
+  const seconds = Number(match[3] || 0);
+  return Math.max(hours * 3600 + minutes * 60 + seconds, 0);
+}
+
+function parseYoutubeEmbed(url) {
+  const host = url.hostname.toLowerCase();
+  let videoId = "";
+  if (host === "youtu.be") {
+    videoId = url.pathname.split("/").filter(Boolean)[0] || "";
+  } else if (
+    host === "youtube.com" ||
+    host === "www.youtube.com" ||
+    host === "m.youtube.com" ||
+    host === "youtube-nocookie.com" ||
+    host === "www.youtube-nocookie.com"
+  ) {
+    if (url.pathname === "/watch") {
+      videoId = url.searchParams.get("v") || "";
+    } else {
+      const parts = url.pathname.split("/").filter(Boolean);
+      if (parts[0] === "embed" || parts[0] === "shorts" || parts[0] === "live") {
+        videoId = parts[1] || "";
+      }
+    }
+  }
+
+  if (!/^[a-zA-Z0-9_-]{6,20}$/.test(videoId)) {
+    return null;
+  }
+  const startSeconds = Math.max(
+    Number(url.searchParams.get("start") || 0) || 0,
+    parseDurationToSeconds(url.searchParams.get("t"))
+  );
+  const startQuery = startSeconds > 0 ? `?start=${startSeconds}` : "";
+  return {
+    className: "embed-youtube",
+    title: "YouTube",
+    src: `https://www.youtube.com/embed/${videoId}${startQuery}`,
+    allow:
+      "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share",
+    allowFullscreen: true,
+    caption: "YouTube 嵌入",
+  };
+}
+
+function parseBilibiliEmbed(url) {
+  const host = url.hostname.toLowerCase();
+  if (
+    !host.endsWith("bilibili.com") &&
+    host !== "b23.tv"
+  ) {
+    return null;
+  }
+  const path = url.pathname;
+  let bvid = "";
+  let aid = "";
+  const bvMatch = path.match(/\/(BV[0-9A-Za-z]{10,})/);
+  if (bvMatch) {
+    bvid = bvMatch[1];
+  }
+  const avMatch = path.match(/\/av(\d+)/i);
+  if (avMatch) {
+    aid = avMatch[1];
+  }
+  if (!bvid && !aid) {
+    return null;
+  }
+  const pageValue = Number(url.searchParams.get("p") || 1);
+  const page = Number.isFinite(pageValue) && pageValue > 0 ? Math.floor(pageValue) : 1;
+  const query = bvid
+    ? `bvid=${encodeURIComponent(bvid)}&page=${page}`
+    : `aid=${encodeURIComponent(aid)}&page=${page}`;
+  return {
+    className: "embed-bilibili",
+    title: "Bilibili",
+    src: `https://player.bilibili.com/player.html?${query}`,
+    allow: "autoplay; fullscreen; picture-in-picture",
+    allowFullscreen: true,
+    caption: "Bilibili 嵌入",
+  };
+}
+
+function parseSpotifyEmbed(url) {
+  const host = url.hostname.toLowerCase();
+  if (host !== "open.spotify.com") {
+    return null;
+  }
+  const parts = url.pathname.split("/").filter(Boolean);
+  const type = parts[0] || "";
+  const id = parts[1] || "";
+  const supportedTypes = new Set(["track", "episode", "album", "playlist", "show", "artist"]);
+  if (!supportedTypes.has(type) || !id) {
+    return null;
+  }
+  return {
+    className: "embed-spotify",
+    title: "Spotify",
+    src: `https://open.spotify.com/embed/${encodeURIComponent(type)}/${encodeURIComponent(id)}`,
+    allow: "autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture",
+    allowFullscreen: true,
+    caption: "Spotify 嵌入",
+  };
+}
+
+function parseXEmbed(url) {
+  const host = url.hostname.toLowerCase();
+  if (
+    host !== "x.com" &&
+    host !== "www.x.com" &&
+    host !== "twitter.com" &&
+    host !== "www.twitter.com" &&
+    host !== "mobile.twitter.com"
+  ) {
+    return null;
+  }
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length < 3 || parts[1].toLowerCase() !== "status") {
+    return null;
+  }
+  const username = parts[0];
+  const statusId = parts[2];
+  if (!/^\d{1,30}$/.test(statusId)) {
+    return null;
+  }
+  const canonical = `https://x.com/${encodeURIComponent(username)}/status/${statusId}`;
+  return {
+    className: "embed-x",
+    title: "X",
+    src: `https://twitframe.com/show?url=${encodeURIComponent(canonical)}`,
+    allow: "autoplay; clipboard-write; encrypted-media; picture-in-picture",
+    allowFullscreen: false,
+    caption: "X 貼文嵌入",
+  };
+}
+
+function parseInstagramEmbed(url) {
+  const host = url.hostname.toLowerCase();
+  if (host !== "instagram.com" && host !== "www.instagram.com") {
+    return null;
+  }
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length < 2) {
+    return null;
+  }
+  const type = parts[0].toLowerCase();
+  const code = parts[1];
+  if (!["p", "reel", "tv"].includes(type) || !code) {
+    return null;
+  }
+  return {
+    className: "embed-instagram",
+    title: "Instagram",
+    src: `https://www.instagram.com/${type}/${encodeURIComponent(code)}/embed`,
+    allow: "autoplay; encrypted-media; picture-in-picture; web-share",
+    allowFullscreen: false,
+    caption: "Instagram 嵌入",
+  };
+}
+
+function renderEmbedBlockFromUrl(rawUrl) {
+  const input = String(rawUrl || "").trim();
+  if (!input) {
+    return "";
+  }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(input);
+  } catch {
+    return "";
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    return "";
+  }
+
+  const parsers = [
+    parseYoutubeEmbed,
+    parseBilibiliEmbed,
+    parseSpotifyEmbed,
+    parseXEmbed,
+    parseInstagramEmbed,
+  ];
+  let embed = null;
+  for (const parser of parsers) {
+    embed = parser(parsedUrl);
+    if (embed) {
+      break;
+    }
+  }
+  if (!embed) {
+    return "";
+  }
+
+  const safeSrc = escapeHtml(embed.src || input);
+  const safeTitle = escapeHtml(embed.title || "Embedded media");
+  const safeClassName = escapeHtml(embed.className || "embed-generic");
+  const safeCaption = escapeHtml(embed.caption || input);
+  const allow = embed.allow ? ` allow="${escapeHtml(embed.allow)}"` : "";
+  const allowFullscreen = embed.allowFullscreen ? " allowfullscreen" : "";
+
+  return `<figure class="embed-block ${safeClassName}">
+    <iframe src="${safeSrc}" title="${safeTitle}" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"${allow}${allowFullscreen}></iframe>
+    <figcaption class="embed-caption">${safeCaption}</figcaption>
+  </figure>`;
 }
 
 function renderInline(value) {

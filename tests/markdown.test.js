@@ -69,3 +69,22 @@ test("renderMarkdown supports nested lists and task checkboxes", () => {
   assert.match(html, /<input type="checkbox" disabled \/>/);
   assert.match(html, /<input type="checkbox" checked disabled \/>/);
 });
+
+test("renderMarkdown supports standalone media embeds", () => {
+  const html = renderMarkdown(`https://www.youtube.com/watch?v=dQw4w9WgXcQ
+
+https://open.spotify.com/track/11dFghVXANMlKmJXsNCbNl
+
+https://x.com/jack/status/20
+
+https://www.instagram.com/p/CxXnabc1234/`);
+
+  assert.match(html, /class="embed-block embed-youtube"/);
+  assert.match(html, /youtube\.com\/embed\/dQw4w9WgXcQ/);
+  assert.match(html, /class="embed-block embed-spotify"/);
+  assert.match(html, /open\.spotify\.com\/embed\/track\/11dFghVXANMlKmJXsNCbNl/);
+  assert.match(html, /class="embed-block embed-x"/);
+  assert.match(html, /twitframe\.com\/show\?url=/);
+  assert.match(html, /class="embed-block embed-instagram"/);
+  assert.match(html, /instagram\.com\/p\/CxXnabc1234\/embed/);
+});

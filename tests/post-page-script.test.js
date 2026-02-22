@@ -145,7 +145,7 @@ test("post page renders reactions and view counter", () => {
     }
   );
 
-  assert.match(html, /訪問 1,234/);
+  assert.match(html, /訪問 <span id="post-view-count">1,234<\/span>/);
   assert.match(html, /id="reactions"/);
   assert.match(html, /data-reaction-key="lion"/);
   assert.match(html, /class="reaction-btn active"/);
