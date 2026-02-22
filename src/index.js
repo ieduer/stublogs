@@ -1,3 +1,5 @@
+import { scryptSync } from "node:crypto";
+
 const DEFAULT_RESERVED_SLUGS = [
   "app",
   "www",
@@ -28,6 +30,11 @@ const LEGACY_FOOTER_NOTE = "在這裡，把語文寫成你自己。";
 const POSTS_PAGE_SIZE = 10;
 const COMMENTS_PAGE_SIZE = 20;
 const DEFAULT_FAVICON_URL = "https://img.bdfz.net/20250503004.webp";
+const PASSWORD_SCRYPT_N = 1 << 14;
+const PASSWORD_SCRYPT_R = 8;
+const PASSWORD_SCRYPT_P = 1;
+const PASSWORD_SCRYPT_KEYLEN = 32;
+const PUBLIC_SSR_CACHE_CONTROL = "public, s-maxage=60, stale-while-revalidate=120";
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
@@ -245,11 +252,11 @@ async function handleRequest(request, env, ctx) {
   if (path === "/") {
     const siteConfig = await getSiteConfig(env, site);
     const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
-    const [postsPage, communitySites, campusFeed, sitePages] = await Promise.all([
+    const [postsPage, sitePages, communitySites, campusFeed] = await Promise.all([
       listPostsPage(env, site.id, page, POSTS_PAGE_SIZE),
-      listCommunitySites(env, site.slug, 12),
-      listCampusFeed(env, site.id, 18),
       listSitePages(env, site.id, 20),
+      siteConfig.hideCommunitySites ? Promise.resolve([]) : listCommunitySites(env, site.slug, 12),
+      siteConfig.hideCampusFeed ? Promise.resolve([]) : listCampusFeed(env, site.id, 18),
     ]);
     return html(
       renderSiteHomePage(
@@ -262,7 +269,8 @@ async function handleRequest(request, env, ctx) {
         baseDomain,
         postsPage
       ),
-      200
+      200,
+      { "Cache-Control": PUBLIC_SSR_CACHE_CONTROL }
     );
   }
 
@@ -348,7 +356,8 @@ async function handleRequest(request, env, ctx) {
       commentsTotal: commentsData.total,
       commentBasePath: `/${encodeURIComponent(post.postSlug)}`,
     }),
-    200
+    200,
+    { "Cache-Control": PUBLIC_SSR_CACHE_CONTROL }
   );
 }
 
@@ -397,6 +406,22 @@ async function handleApi(request, env, ctx, context) {
   }
 
   if (request.method === "POST" && path === "/api/register") {
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const registerRate = await consumeRateLimit(
+      env,
+      `${clientIp}:register`,
+      10 * 60 * 1000,
+      8,
+      ctx
+    );
+    if (!registerRate.allowed) {
+      return json(
+        { error: "Too many registration attempts, please try later" },
+        429,
+        { "Retry-After": String(Math.ceil(registerRate.retryAfterMs / 1000)) }
+      );
+    }
+
     const body = await readJson(request);
 
     const slug = String(body.slug || "")
@@ -698,7 +723,8 @@ async function handleApi(request, env, ctx, context) {
       env,
       rateKey,
       LOGIN_RATE_WINDOW_MS,
-      LOGIN_RATE_MAX_ATTEMPTS
+      LOGIN_RATE_MAX_ATTEMPTS,
+      ctx
     );
     if (!rateResult.allowed) {
       return json(
@@ -726,6 +752,21 @@ async function handleApi(request, env, ctx, context) {
     const verified = await verifyPassword(password, site.adminSecretHash, env);
     if (!verified) {
       return json({ error: "Invalid credentials" }, 401);
+    }
+
+    if (isLegacyPasswordHash(site.adminSecretHash)) {
+      try {
+        const upgradedHash = await createPasswordHash(password, env);
+        await env.DB.prepare(
+          `UPDATE sites
+           SET admin_secret_hash = ?, updated_at = ?
+           WHERE id = ?`
+        )
+          .bind(upgradedHash, new Date().toISOString(), site.id)
+          .run();
+      } catch (error) {
+        console.error("Failed to upgrade legacy password hash", error);
+      }
     }
 
     await clearRateLimit(env, rateKey);
@@ -919,7 +960,8 @@ async function handleApi(request, env, ctx, context) {
       env,
       rateKey,
       COMMENT_RATE_WINDOW_MS,
-      COMMENT_RATE_MAX_ATTEMPTS
+      COMMENT_RATE_MAX_ATTEMPTS,
+      ctx
     );
     if (!rateResult.allowed) {
       return json(
@@ -1192,15 +1234,18 @@ async function handleApi(request, env, ctx, context) {
 
     const posts = await listPosts(env, site.id, true);
     const config = await getSiteConfig(env, site);
-    const exportedPosts = [];
-
-    for (const post of posts) {
-      const file = await githubReadFile(env, getPostFilePath(site.slug, post.postSlug));
-      exportedPosts.push({
-        ...post,
-        content: file ? file.content : "",
-      });
-    }
+    const files = await Promise.all(
+      posts.map((post) =>
+        githubReadFile(env, getPostFilePath(site.slug, post.postSlug)).catch((error) => {
+          console.error("Failed to read post during export", post.postSlug, error);
+          return null;
+        })
+      )
+    );
+    const exportedPosts = posts.map((post, index) => ({
+      ...post,
+      content: files[index] ? files[index].content : "",
+    }));
 
     const payload = {
       exportedAt: new Date().toISOString(),
@@ -1660,8 +1705,9 @@ async function ensureRateLimitsTable(env) {
   return rateLimitsTableReadyPromise;
 }
 
-async function consumeRateLimit(env, rateKey, windowMs, maxAttempts) {
+async function consumeRateLimit(env, rateKey, windowMs, maxAttempts, ctx = null) {
   await ensureRateLimitsTable(env);
+  maybeScheduleRateLimitGc(env, ctx);
 
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
@@ -1724,6 +1770,24 @@ async function consumeRateLimit(env, rateKey, windowMs, maxAttempts) {
     remaining: Math.max(safeMaxAttempts - nextAttempts, 0),
     retryAfterMs: 0,
   };
+}
+
+function maybeScheduleRateLimitGc(env, ctx = null) {
+  if (Math.random() >= 0.01) {
+    return;
+  }
+  const cleanupPromise = env.DB.prepare(
+    `DELETE FROM rate_limits
+     WHERE updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')`
+  )
+    .run()
+    .catch((error) => {
+      console.error("Failed to cleanup stale rate limits", error);
+    });
+
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(cleanupPromise);
+  }
 }
 
 async function clearRateLimit(env, rateKey) {
@@ -2238,27 +2302,24 @@ function getPostFilePath(siteSlug, postSlug) {
 }
 
 function defaultSiteConfigFromSite(site) {
-  return normalizeSiteConfig(
-    {
-      slug: site.slug,
-      displayName: site.displayName,
-      description: site.description || "",
-      heroTitle: "",
-      heroSubtitle: "",
-      colorTheme: "default",
-      footerNote: "",
-      customCss: "",
-      faviconUrl: DEFAULT_FAVICON_URL,
-      headerLinks: [],
-      hideCommunitySites: false,
-      hideCampusFeed: false,
-      commentsEnabled: true,
-      createdAt: site.createdAt || new Date().toISOString(),
-      updatedAt: site.updatedAt || new Date().toISOString(),
-      exportVersion: SITE_CONFIG_VERSION,
-    },
-    site
-  );
+  return {
+    slug: site.slug,
+    displayName: site.displayName || site.slug,
+    description: site.description || "",
+    heroTitle: "",
+    heroSubtitle: "",
+    colorTheme: "default",
+    footerNote: "",
+    customCss: "",
+    faviconUrl: DEFAULT_FAVICON_URL,
+    headerLinks: [],
+    hideCommunitySites: false,
+    hideCampusFeed: false,
+    commentsEnabled: true,
+    createdAt: site.createdAt || new Date().toISOString(),
+    updatedAt: site.updatedAt || new Date().toISOString(),
+    exportVersion: SITE_CONFIG_VERSION,
+  };
 }
 
 function sanitizeHexColor(value) {
@@ -2334,7 +2395,7 @@ function sanitizeFaviconUrl(value) {
 
 function normalizeSiteConfig(rawConfig, site) {
   const base = site
-    ? defaultSiteConfigFromSiteBase(site)
+    ? defaultSiteConfigFromSite(site)
     : {
       slug: "",
       displayName: "",
@@ -2380,29 +2441,8 @@ function normalizeSiteConfig(rawConfig, site) {
   };
 }
 
-function defaultSiteConfigFromSiteBase(site) {
-  return {
-    slug: site.slug,
-    displayName: site.displayName || site.slug,
-    description: site.description || "",
-    heroTitle: "",
-    heroSubtitle: "",
-    colorTheme: "default",
-    footerNote: "",
-    customCss: "",
-    faviconUrl: DEFAULT_FAVICON_URL,
-    headerLinks: [],
-    hideCommunitySites: false,
-    hideCampusFeed: false,
-    commentsEnabled: true,
-    createdAt: site.createdAt || new Date().toISOString(),
-    updatedAt: site.updatedAt || new Date().toISOString(),
-    exportVersion: SITE_CONFIG_VERSION,
-  };
-}
-
 async function getSiteConfig(env, site) {
-  const fallback = defaultSiteConfigFromSite(site);
+  const fallback = normalizeSiteConfig({}, site);
   const filePath = getSiteConfigPath(site.slug);
 
   try {
@@ -2456,18 +2496,81 @@ async function notifyTelegramNewSite(env, payload) {
 
 async function createPasswordHash(password, env) {
   const salt = randomHex(16);
-  const digest = await sha256Hex(`${salt}:${password}:${getSessionSecret(env)}`);
-  return `${salt}:${digest}`;
+  const digest = deriveScryptHex(password, salt, env, {
+    n: PASSWORD_SCRYPT_N,
+    r: PASSWORD_SCRYPT_R,
+    p: PASSWORD_SCRYPT_P,
+    keyLength: PASSWORD_SCRYPT_KEYLEN,
+  });
+  return `scrypt$${PASSWORD_SCRYPT_N}$${PASSWORD_SCRYPT_R}$${PASSWORD_SCRYPT_P}$${salt}$${digest}`;
 }
 
 async function verifyPassword(password, stored, env) {
+  const parsedScrypt = parseScryptPasswordHash(stored);
+  if (parsedScrypt) {
+    const digest = deriveScryptHex(password, parsedScrypt.salt, env, {
+      n: parsedScrypt.n,
+      r: parsedScrypt.r,
+      p: parsedScrypt.p,
+      keyLength: PASSWORD_SCRYPT_KEYLEN,
+    });
+    return timingSafeEqual(parsedScrypt.digest, digest);
+  }
+
   const [salt, hash] = String(stored || "").split(":");
   if (!salt || !hash) {
     return false;
   }
-
   const digest = await sha256Hex(`${salt}:${password}:${getSessionSecret(env)}`);
   return timingSafeEqual(hash, digest);
+}
+
+function parseScryptPasswordHash(stored) {
+  const raw = String(stored || "");
+  if (!raw.startsWith("scrypt$")) {
+    return null;
+  }
+  const parts = raw.split("$");
+  if (parts.length !== 6) {
+    return null;
+  }
+
+  const n = Number(parts[1]);
+  const r = Number(parts[2]);
+  const p = Number(parts[3]);
+  const salt = String(parts[4] || "");
+  const digest = String(parts[5] || "");
+  if (!Number.isFinite(n) || !Number.isFinite(r) || !Number.isFinite(p)) {
+    return null;
+  }
+  if (!salt || !/^[a-f0-9]{16,64}$/i.test(salt)) {
+    return null;
+  }
+  if (!digest || !/^[a-f0-9]{32,256}$/i.test(digest)) {
+    return null;
+  }
+
+  return { n, r, p, salt, digest: digest.toLowerCase() };
+}
+
+function isLegacyPasswordHash(stored) {
+  return !String(stored || "").startsWith("scrypt$");
+}
+
+function deriveScryptHex(password, salt, env, options) {
+  const keyLength = Math.max(Number(options?.keyLength || PASSWORD_SCRYPT_KEYLEN), 16);
+  const n = Math.max(Number(options?.n || PASSWORD_SCRYPT_N), 2);
+  const r = Math.max(Number(options?.r || PASSWORD_SCRYPT_R), 1);
+  const p = Math.max(Number(options?.p || PASSWORD_SCRYPT_P), 1);
+
+  const material = `${String(password || "")}:${getSessionSecret(env)}`;
+  const derived = scryptSync(material, salt, keyLength, {
+    N: n,
+    r,
+    p,
+    maxmem: 128 * 1024 * 1024,
+  });
+  return derived.toString("hex");
 }
 
 async function createSessionToken(slug, env) {
@@ -2844,15 +2947,35 @@ function sanitizeDescription(value) {
 }
 
 function sanitizeCustomCss(value) {
-  return String(value || "")
+  const css = String(value || "")
     .replace(/\u0000/g, "")
     .replace(/<\/style/gi, "")
-    .replace(/@import\b/gi, "")
-    .replace(/expression\s*\(/gi, "")
-    .replace(/url\s*\(\s*['"]?\s*javascript:/gi, "url(")
-    .replace(/behavior\s*:/gi, "")
     .trim()
     .slice(0, 8000);
+
+  const decoded = decodeCssEscapesForScan(css).toLowerCase();
+  if (
+    /@import\b/.test(decoded) ||
+    /expression\s*\(/.test(decoded) ||
+    /javascript\s*:/.test(decoded) ||
+    /behavior\s*:/.test(decoded)
+  ) {
+    return "";
+  }
+
+  return css;
+}
+
+function decodeCssEscapesForScan(input) {
+  return String(input || "")
+    .replace(/\\([0-9a-fA-F]{1,6})\s?/g, (_, hex) => {
+      const codePoint = Number.parseInt(hex, 16);
+      if (!Number.isFinite(codePoint) || codePoint <= 0) {
+        return "";
+      }
+      return String.fromCodePoint(Math.min(codePoint, 0x10ffff));
+    })
+    .replace(/\\([^0-9a-fA-F])/g, "$1");
 }
 
 function sanitizeCommentAuthor(value) {
@@ -2904,7 +3027,7 @@ function text(body, status = 200) {
   });
 }
 
-function html(body, status = 200) {
+function html(body, status = 200, extraHeaders = {}) {
   return new Response(body, {
     status,
     headers: {
@@ -2913,6 +3036,7 @@ function html(body, status = 200) {
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
       "Referrer-Policy": "strict-origin-when-cross-origin",
+      ...extraHeaders,
     },
   });
 }
@@ -2962,7 +3086,7 @@ function renderRootPage(baseDomain) {
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
-        statusEl.style.color = isError ? "#ae3a22" : "#6b6357";
+        statusEl.style.color = isError ? "var(--danger)" : "var(--muted)";
       }
 
       async function checkSlug() {
@@ -3075,7 +3199,7 @@ function renderClaimPage(slug, baseDomain) {
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
-        statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+        statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
       }
 
       form.addEventListener('submit', async (event) => {
@@ -3421,7 +3545,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
 
           function setCommentStatus(message, isError) {
             statusEl.textContent = message;
-            statusEl.style.color = isError ? '#ae3a22' : 'var(--muted)';
+            statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
           }
 
           form.addEventListener('submit', async (event) => {
@@ -3515,7 +3639,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
         function setStatus(message, isError = false) {
           statusEl.textContent = message;
-          statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+          statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
         }
 
         form.addEventListener('submit', async (event) => {
@@ -3769,7 +3893,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
 
       function setStatus(message, isError = false) {
         statusEl.textContent = message;
-        statusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+        statusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
       }
 
       function setSettingsStatus(message, isError = false) {
@@ -3777,7 +3901,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
           return;
         }
         settingsStatusEl.textContent = message;
-        settingsStatusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+        settingsStatusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
       }
 
       function setPasswordStatus(message, isError = false) {
@@ -3785,7 +3909,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
           return;
         }
         passwordStatusEl.textContent = message;
-        passwordStatusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+        passwordStatusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
       }
 
       function toSlug(value, withFallback = false) {
@@ -4036,7 +4160,7 @@ function setCommentAdminStatus(message, isError = false) {
     return;
   }
   commentAdminStatusEl.textContent = message;
-  commentAdminStatusEl.style.color = isError ? '#ae3a22' : '#6b6357';
+  commentAdminStatusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
 }
 
 function renderCommentAdminList() {
@@ -4803,6 +4927,7 @@ function renderLayout(
   --panel: rgba(255,252,247,0.92);
   --line: rgba(57,47,38,0.15);
   --accent: #7b5034;
+  --danger: #b24329;
   --accent-glow: rgba(123,80,52,0.15);
   --code-bg: rgba(90,82,69,0.1);
   --font-mono: 'Fira Code','JetBrains Mono',Menlo,Consolas,monospace;
@@ -4826,6 +4951,7 @@ function renderLayout(
     --panel: rgba(20,26,34,0.92);
     --line: rgba(100,180,255,0.08);
     --accent: #5ca0d0;
+    --danger: #ff8c73;
     --accent-glow: rgba(92,160,208,0.12);
     --code-bg: rgba(255,255,255,0.06);
   }
@@ -4894,6 +5020,8 @@ button:active,.link-button:active{transform:translateY(0)}
 .article-body hr{border:none;border-top:1px dashed var(--line);margin:1.2rem 0}
 .article-body blockquote{border-left:3px solid var(--accent);padding:.5rem 0 .5rem 1rem;margin:1rem 0;color:var(--muted);background:var(--accent-glow);border-radius:0 8px 8px 0}
 .article-body ul,.article-body ol{padding-left:1.4rem;margin:.6rem 0}
+.article-body .task-label{display:inline-flex;align-items:flex-start;gap:.45rem}
+.article-body .task-label input[type="checkbox"]{margin-top:.25rem;accent-color:var(--accent)}
 .article-body del{opacity:.75}
 .article-body img{max-width:100%;border-radius:8px;margin:.8rem 0}
 .article-wrap{display:grid;grid-template-columns:minmax(0,1fr) 240px;gap:1.2rem}
@@ -5187,7 +5315,13 @@ export function renderMarkdown(source) {
     if (!bulletItems.length) {
       return;
     }
-    blocks.push(`<ul>${bulletItems.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul>`);
+    blocks.push(renderNestedListHtml(bulletItems, "ul", (item) => {
+      if (item.task) {
+        const checkedAttr = item.checked ? " checked" : "";
+        return `<label class="task-label"><input type="checkbox"${checkedAttr} disabled /><span>${renderInline(item.text)}</span></label>`;
+      }
+      return renderInline(item.text);
+    }));
     bulletItems = [];
   };
 
@@ -5195,7 +5329,7 @@ export function renderMarkdown(source) {
     if (!orderedItems.length) {
       return;
     }
-    blocks.push(`<ol>${orderedItems.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ol>`);
+    blocks.push(renderNestedListHtml(orderedItems, "ol", (item) => renderInline(item.text)));
     orderedItems = [];
   };
 
@@ -5299,21 +5433,31 @@ export function renderMarkdown(source) {
       continue;
     }
 
-    const listItem = line.match(/^\s*[-*]\s+(.+)$/);
+    const listItem = line.match(/^(\s*)[-*]\s+(.+)$/);
     if (listItem) {
       flushParagraph();
       flushOrderedList();
       flushQuote();
-      bulletItems.push(listItem[1]);
+      const listText = listItem[2];
+      const taskMatch = listText.match(/^\[([ xX])\]\s+(.*)$/);
+      bulletItems.push({
+        level: listIndentLevel(listItem[1]),
+        text: taskMatch ? taskMatch[2] : listText,
+        task: Boolean(taskMatch),
+        checked: Boolean(taskMatch && taskMatch[1].toLowerCase() === "x"),
+      });
       continue;
     }
 
-    const orderedItem = line.match(/^\s*\d+\.\s+(.+)$/);
+    const orderedItem = line.match(/^(\s*)\d+\.\s+(.+)$/);
     if (orderedItem) {
       flushParagraph();
       flushBulletList();
       flushQuote();
-      orderedItems.push(orderedItem[1]);
+      orderedItems.push({
+        level: listIndentLevel(orderedItem[1]),
+        text: orderedItem[2],
+      });
       continue;
     }
 
@@ -5347,6 +5491,45 @@ export function renderMarkdown(source) {
   flushMathBlock();
 
   return blocks.join("\n");
+}
+
+function listIndentLevel(rawIndent) {
+  const spaces = String(rawIndent || "")
+    .replace(/\t/g, "  ")
+    .length;
+  return Math.max(Math.floor(spaces / 2), 0);
+}
+
+function renderNestedListHtml(items, listTag, renderItemContent) {
+  const normalizedItems = items.map((item) => ({
+    ...item,
+    level: Math.max(Number(item.level) || 0, 0),
+    children: [],
+  }));
+  const roots = [];
+  const stack = [{ level: -1, children: roots }];
+
+  for (const item of normalizedItems) {
+    while (stack.length > 1 && stack[stack.length - 1].level >= item.level) {
+      stack.pop();
+    }
+    stack[stack.length - 1].children.push(item);
+    stack.push(item);
+  }
+
+  const renderNodes = (nodes) => {
+    if (!nodes.length) {
+      return "";
+    }
+    return `<${listTag}>${nodes
+      .map((node) => {
+        const childHtml = renderNodes(node.children);
+        return `<li>${renderItemContent(node)}${childHtml}</li>`;
+      })
+      .join("")}</${listTag}>`;
+  };
+
+  return renderNodes(roots);
 }
 
 function renderInline(value) {
@@ -5410,7 +5593,7 @@ function renderInline(value) {
       return `![${altText}](${escapeHtml(rawUrl)})`;
     }
     const safeUrl = escapeHtml(rawUrl);
-    const safeAlt = String(altText || "").trim();
+    const safeAlt = escapeHtml(String(altText || "").trim());
     return `<img src="${safeUrl}" alt="${safeAlt}" loading="lazy" referrerpolicy="no-referrer" />`;
   });
 

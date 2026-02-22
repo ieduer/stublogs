@@ -57,3 +57,15 @@ test("renderMarkdown merges multiline quote and supports image syntax", () => {
     /<img src="https:\/\/img\.example\.com\/cover\.webp" alt="封面" loading="lazy" referrerpolicy="no-referrer" \/>/
   );
 });
+
+test("renderMarkdown supports nested lists and task checkboxes", () => {
+  const html = renderMarkdown(`- 一級
+  - 二級
+    - 三級
+- [ ] 待辦
+- [x] 完成`);
+
+  assert.match(html, /<ul><li>一級<ul><li>二級<ul><li>三級<\/li><\/ul><\/li><\/ul><\/li><li>/);
+  assert.match(html, /<input type="checkbox" disabled \/>/);
+  assert.match(html, /<input type="checkbox" checked disabled \/>/);
+});
