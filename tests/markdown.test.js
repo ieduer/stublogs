@@ -44,3 +44,16 @@ $$`);
   assert.match(html, /\$a\^2\+b\^2=c\^2\$/);
   assert.match(html, /<div class="math-block">\\\[/);
 });
+
+test("renderMarkdown merges multiline quote and supports image syntax", () => {
+  const html = renderMarkdown(`> 第一行
+> 第二行
+
+![封面](https://img.example.com/cover.webp)`);
+
+  assert.match(html, /<blockquote>第一行<br \/>第二行<\/blockquote>/);
+  assert.match(
+    html,
+    /<img src="https:\/\/img\.example\.com\/cover\.webp" alt="封面" loading="lazy" referrerpolicy="no-referrer" \/>/
+  );
+});

@@ -31,11 +31,11 @@ const DEFAULT_FAVICON_URL = "https://img.bdfz.net/20250503004.webp";
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
-const loginAttempts = new Map();
 const COMMENT_RATE_WINDOW_MS = 60 * 1000;
 const COMMENT_RATE_MAX_ATTEMPTS = 6;
-const commentAttempts = new Map();
 let commentsTableReadyPromise = null;
+let rateLimitsTableReadyPromise = null;
+const postsColumnsPromiseByDb = new WeakMap();
 
 export default {
   async fetch(request, env, ctx) {
@@ -132,14 +132,30 @@ export function getHostSlug(hostname, baseDomain) {
 }
 
 export function slugifyValue(value) {
-  return String(value || "")
-    .toLowerCase()
-    .trim()
+  const raw = String(value || "").toLowerCase().trim();
+  const slug = raw
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 80);
+
+  if (slug) {
+    return slug;
+  }
+  if (!raw) {
+    return "";
+  }
+  return `post-${stableShortHash(raw)}`.slice(0, 80);
+}
+
+function stableShortHash(input) {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36).padStart(6, "0").slice(0, 8);
 }
 
 async function handleRequest(request, env, ctx) {
@@ -678,11 +694,18 @@ async function handleApi(request, env, ctx, context) {
 
     const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
     const rateKey = `${clientIp}:${hostSlug}`;
-    const now = Date.now();
-    const attempts = loginAttempts.get(rateKey) || [];
-    const recent = attempts.filter((t) => now - t < LOGIN_RATE_WINDOW_MS);
-    if (recent.length >= LOGIN_RATE_MAX_ATTEMPTS) {
-      return json({ error: "Too many login attempts, please try later" }, 429);
+    const rateResult = await consumeRateLimit(
+      env,
+      rateKey,
+      LOGIN_RATE_WINDOW_MS,
+      LOGIN_RATE_MAX_ATTEMPTS
+    );
+    if (!rateResult.allowed) {
+      return json(
+        { error: "Too many login attempts, please try later" },
+        429,
+        { "Retry-After": String(Math.ceil(rateResult.retryAfterMs / 1000)) }
+      );
     }
 
     const body = await readJson(request);
@@ -702,12 +725,10 @@ async function handleApi(request, env, ctx, context) {
 
     const verified = await verifyPassword(password, site.adminSecretHash, env);
     if (!verified) {
-      recent.push(now);
-      loginAttempts.set(rateKey, recent);
       return json({ error: "Invalid credentials" }, 401);
     }
 
-    loginAttempts.delete(rateKey);
+    await clearRateLimit(env, rateKey);
     const token = await createSessionToken(site.slug, env);
     const response = json({ ok: true }, 200);
     return withCookie(response, buildSessionCookie(token));
@@ -894,11 +915,18 @@ async function handleApi(request, env, ctx, context) {
 
     const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
     const rateKey = `${clientIp}:${site.slug}:comments`;
-    const nowTs = Date.now();
-    const attempts = commentAttempts.get(rateKey) || [];
-    const recent = attempts.filter((t) => nowTs - t < COMMENT_RATE_WINDOW_MS);
-    if (recent.length >= COMMENT_RATE_MAX_ATTEMPTS) {
-      return json({ error: "Too many comments, please try later" }, 429);
+    const rateResult = await consumeRateLimit(
+      env,
+      rateKey,
+      COMMENT_RATE_WINDOW_MS,
+      COMMENT_RATE_MAX_ATTEMPTS
+    );
+    if (!rateResult.allowed) {
+      return json(
+        { error: "Too many comments, please try later" },
+        429,
+        { "Retry-After": String(Math.ceil(rateResult.retryAfterMs / 1000)) }
+      );
     }
 
     const body = await readJson(request);
@@ -921,8 +949,6 @@ async function handleApi(request, env, ctx, context) {
       return json({ error: "Post not found" }, 404);
     }
 
-    recent.push(nowTs);
-    commentAttempts.set(rateKey, recent);
     const created = await createComment(env, site.id, postSlug, authorName, authorSite, content);
     return json({ ok: true, comment: created }, 201);
   }
@@ -1487,44 +1513,38 @@ async function listCampusFeed(env, excludeSiteId = null, limit = 24) {
 async function listPostsPage(env, siteId, page = 1, pageSize = POSTS_PAGE_SIZE) {
   const safePageSize = Math.min(Math.max(Number(pageSize) || POSTS_PAGE_SIZE, 1), 60);
   const safePage = Math.max(Number(page) || 1, 1);
-  const offset = (safePage - 1) * safePageSize;
   const hasIsPageColumn = await hasPostsColumn(env, "is_page");
   const isPageSelect = hasIsPageColumn ? "is_page AS isPage" : "0 AS isPage";
   const pageFilter = hasIsPageColumn ? "AND is_page = 0" : "";
 
-  const [rowsResult, totalResult] = await Promise.all([
-    env.DB.prepare(
-      `SELECT
-        post_slug AS postSlug,
-        title,
-        description,
-        published,
-        ${isPageSelect},
-        created_at AS createdAt,
-        updated_at AS updatedAt
-      FROM posts
-      WHERE site_id = ? AND published = 1 ${pageFilter}
-      ORDER BY updated_at DESC
-      LIMIT ? OFFSET ?`
-    )
-      .bind(siteId, safePageSize, offset)
-      .all(),
-    env.DB.prepare(
-      `SELECT COUNT(*) AS total
-      FROM posts
-      WHERE site_id = ? AND published = 1 ${pageFilter}`
-    )
-      .bind(siteId)
-      .first(),
-  ]);
+  const totalResult = await env.DB.prepare(
+    `SELECT COUNT(*) AS total
+     FROM posts
+     WHERE site_id = ? AND published = 1 ${pageFilter}`
+  )
+    .bind(siteId)
+    .first();
 
-  const total = Number(totalResult?.total || 0);
+  const total = Math.max(Number(totalResult?.total || 0), 0);
   const totalPages = Math.max(1, Math.ceil(total / safePageSize));
   const boundedPage = Math.min(safePage, totalPages);
-
-  if (boundedPage !== safePage) {
-    return listPostsPage(env, siteId, boundedPage, safePageSize);
-  }
+  const offset = (boundedPage - 1) * safePageSize;
+  const rowsResult = await env.DB.prepare(
+    `SELECT
+      post_slug AS postSlug,
+      title,
+      description,
+      published,
+      ${isPageSelect},
+      created_at AS createdAt,
+      updated_at AS updatedAt
+    FROM posts
+    WHERE site_id = ? AND published = 1 ${pageFilter}
+    ORDER BY updated_at DESC
+    LIMIT ? OFFSET ?`
+  )
+    .bind(siteId, safePageSize, offset)
+    .all();
 
   return {
     posts: rowsResult.results || [],
@@ -1617,14 +1637,135 @@ async function ensureCommentsTable(env) {
   return commentsTableReadyPromise;
 }
 
+async function ensureRateLimitsTable(env) {
+  if (!rateLimitsTableReadyPromise) {
+    rateLimitsTableReadyPromise = (async () => {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS rate_limits (
+          rate_key TEXT PRIMARY KEY,
+          window_start_ms INTEGER NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_rate_limits_updated
+         ON rate_limits(updated_at DESC)`
+      ).run();
+    })().catch((error) => {
+      rateLimitsTableReadyPromise = null;
+      throw error;
+    });
+  }
+  return rateLimitsTableReadyPromise;
+}
+
+async function consumeRateLimit(env, rateKey, windowMs, maxAttempts) {
+  await ensureRateLimitsTable(env);
+
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const safeKey = String(rateKey || "").slice(0, 180);
+  const safeWindowMs = Math.max(Number(windowMs) || 60_000, 1_000);
+  const safeMaxAttempts = Math.max(Number(maxAttempts) || 1, 1);
+
+  const existing = await env.DB.prepare(
+    `SELECT window_start_ms AS windowStartMs, attempts
+     FROM rate_limits
+     WHERE rate_key = ?`
+  )
+    .bind(safeKey)
+    .first();
+
+  const windowStartMs = Number(existing?.windowStartMs || 0);
+  const attempts = Number(existing?.attempts || 0);
+  const sameWindow = existing && nowMs - windowStartMs < safeWindowMs;
+
+  if (!sameWindow) {
+    await env.DB.prepare(
+      `INSERT INTO rate_limits (rate_key, window_start_ms, attempts, updated_at)
+       VALUES (?, ?, 1, ?)
+       ON CONFLICT(rate_key) DO UPDATE SET
+         window_start_ms = excluded.window_start_ms,
+         attempts = 1,
+         updated_at = excluded.updated_at`
+    )
+      .bind(safeKey, nowMs, nowIso)
+      .run();
+    return {
+      allowed: true,
+      attempts: 1,
+      remaining: Math.max(safeMaxAttempts - 1, 0),
+      retryAfterMs: 0,
+    };
+  }
+
+  if (attempts >= safeMaxAttempts) {
+    return {
+      allowed: false,
+      attempts,
+      remaining: 0,
+      retryAfterMs: Math.max(safeWindowMs - (nowMs - windowStartMs), 1_000),
+    };
+  }
+
+  const nextAttempts = attempts + 1;
+  await env.DB.prepare(
+    `UPDATE rate_limits
+     SET attempts = ?, updated_at = ?
+     WHERE rate_key = ?`
+  )
+    .bind(nextAttempts, nowIso, safeKey)
+    .run();
+
+  return {
+    allowed: true,
+    attempts: nextAttempts,
+    remaining: Math.max(safeMaxAttempts - nextAttempts, 0),
+    retryAfterMs: 0,
+  };
+}
+
+async function clearRateLimit(env, rateKey) {
+  if (!rateKey) {
+    return;
+  }
+  try {
+    await ensureRateLimitsTable(env);
+    await env.DB.prepare("DELETE FROM rate_limits WHERE rate_key = ?")
+      .bind(String(rateKey).slice(0, 180))
+      .run();
+  } catch (error) {
+    console.error("Failed to clear rate limit", error);
+  }
+}
+
 async function getPostsColumns(env) {
-  const result = await env.DB.prepare("PRAGMA table_info(posts)").all();
-  const rows = result.results || [];
-  return new Set(
-    rows
-      .map((item) => String(item.name || "").toLowerCase())
-      .filter(Boolean)
-  );
+  const db = env?.DB;
+  if (!db) {
+    return new Set();
+  }
+
+  let columnsPromise = postsColumnsPromiseByDb.get(db);
+  if (!columnsPromise) {
+    columnsPromise = db
+      .prepare("PRAGMA table_info(posts)")
+      .all()
+      .then((result) => {
+        const rows = result.results || [];
+        return new Set(
+          rows
+            .map((item) => String(item.name || "").toLowerCase())
+            .filter(Boolean)
+        );
+      })
+      .catch((error) => {
+        postsColumnsPromiseByDb.delete(db);
+        throw error;
+      });
+    postsColumnsPromiseByDb.set(db, columnsPromise);
+  }
+  return columnsPromise;
 }
 
 async function hasPostsColumn(env, columnName) {
@@ -1641,39 +1782,34 @@ async function listPostComments(env, siteId, postSlug, page = 1, pageSize = COMM
   await ensureCommentsTable(env);
   const safePageSize = Math.min(Math.max(Number(pageSize) || COMMENTS_PAGE_SIZE, 1), 80);
   const safePage = Math.max(Number(page) || 1, 1);
-  const offset = (safePage - 1) * safePageSize;
 
-  const [rowsResult, totalResult] = await Promise.all([
-    env.DB.prepare(
-      `SELECT
-        id,
-        post_slug AS postSlug,
-        author_name AS authorName,
-        author_site_slug AS authorSiteSlug,
-        content,
-        created_at AS createdAt
-      FROM comments
-      WHERE site_id = ? AND post_slug = ?
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?`
-    )
-      .bind(siteId, postSlug, safePageSize, offset)
-      .all(),
-    env.DB.prepare(
-      `SELECT COUNT(*) AS total
-       FROM comments
-       WHERE site_id = ? AND post_slug = ?`
-    )
-      .bind(siteId, postSlug)
-      .first(),
-  ]);
+  const totalResult = await env.DB.prepare(
+    `SELECT COUNT(*) AS total
+     FROM comments
+     WHERE site_id = ? AND post_slug = ?`
+  )
+    .bind(siteId, postSlug)
+    .first();
 
-  const total = Number(totalResult?.total || 0);
+  const total = Math.max(Number(totalResult?.total || 0), 0);
   const totalPages = Math.max(1, Math.ceil(total / safePageSize));
   const boundedPage = Math.min(safePage, totalPages);
-  if (boundedPage !== safePage) {
-    return listPostComments(env, siteId, postSlug, boundedPage, safePageSize);
-  }
+  const offset = (boundedPage - 1) * safePageSize;
+  const rowsResult = await env.DB.prepare(
+    `SELECT
+      id,
+      post_slug AS postSlug,
+      author_name AS authorName,
+      author_site_slug AS authorSiteSlug,
+      content,
+      created_at AS createdAt
+    FROM comments
+    WHERE site_id = ? AND post_slug = ?
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?`
+  )
+    .bind(siteId, postSlug, safePageSize, offset)
+    .all();
 
   const comments = (rowsResult.results || []).map((item) => ({
     id: Number(item.id),
@@ -1697,35 +1833,32 @@ async function listSiteComments(env, siteId, page = 1, pageSize = COMMENTS_PAGE_
   await ensureCommentsTable(env);
   const safePageSize = Math.min(Math.max(Number(pageSize) || COMMENTS_PAGE_SIZE, 1), 80);
   const safePage = Math.max(Number(page) || 1, 1);
-  const offset = (safePage - 1) * safePageSize;
 
-  const [rowsResult, totalResult] = await Promise.all([
-    env.DB.prepare(
-      `SELECT
-        id,
-        post_slug AS postSlug,
-        author_name AS authorName,
-        author_site_slug AS authorSiteSlug,
-        content,
-        created_at AS createdAt
-      FROM comments
-      WHERE site_id = ?
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?`
-    )
-      .bind(siteId, safePageSize, offset)
-      .all(),
-    env.DB.prepare("SELECT COUNT(*) AS total FROM comments WHERE site_id = ?")
-      .bind(siteId)
-      .first(),
-  ]);
+  const totalResult = await env.DB.prepare(
+    "SELECT COUNT(*) AS total FROM comments WHERE site_id = ?"
+  )
+    .bind(siteId)
+    .first();
 
-  const total = Number(totalResult?.total || 0);
+  const total = Math.max(Number(totalResult?.total || 0), 0);
   const totalPages = Math.max(1, Math.ceil(total / safePageSize));
   const boundedPage = Math.min(safePage, totalPages);
-  if (boundedPage !== safePage) {
-    return listSiteComments(env, siteId, boundedPage, safePageSize);
-  }
+  const offset = (boundedPage - 1) * safePageSize;
+  const rowsResult = await env.DB.prepare(
+    `SELECT
+      id,
+      post_slug AS postSlug,
+      author_name AS authorName,
+      author_site_slug AS authorSiteSlug,
+      content,
+      created_at AS createdAt
+    FROM comments
+    WHERE site_id = ?
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?`
+  )
+    .bind(siteId, safePageSize, offset)
+    .all();
 
   const comments = (rowsResult.results || []).map((item) => ({
     id: Number(item.id),
@@ -2553,13 +2686,10 @@ function timingSafeEqual(left, right) {
   const a = String(left || "");
   const b = String(right || "");
 
-  if (a.length !== b.length) {
-    return false;
-  }
-
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  const length = Math.max(a.length, b.length);
+  let mismatch = a.length ^ b.length;
+  for (let i = 0; i < length; i += 1) {
+    mismatch |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   }
 
   return mismatch === 0;
@@ -2717,6 +2847,10 @@ function sanitizeCustomCss(value) {
   return String(value || "")
     .replace(/\u0000/g, "")
     .replace(/<\/style/gi, "")
+    .replace(/@import\b/gi, "")
+    .replace(/expression\s*\(/gi, "")
+    .replace(/url\s*\(\s*['"]?\s*javascript:/gi, "url(")
+    .replace(/behavior\s*:/gi, "")
     .trim()
     .slice(0, 8000);
 }
@@ -3654,15 +3788,30 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
         passwordStatusEl.style.color = isError ? '#ae3a22' : '#6b6357';
       }
 
-      function toSlug(value) {
-        return String(value || '')
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9\s-]/g, '')
-      .replace(/\s+/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '')
-      .slice(0, 80);
+      function toSlug(value, withFallback = false) {
+        const raw = String(value || '').toLowerCase().trim();
+        const slug = raw
+          .replace(/[^a-z0-9\s-]/g, '')
+          .replace(/\s+/g, '-')
+          .replace(/-+/g, '-')
+          .replace(/^-|-$/g, '')
+          .slice(0, 80);
+        if (slug) {
+          return slug;
+        }
+        if (!raw || !withFallback) {
+          return '';
+        }
+        return 'post-' + stableClientHash(raw);
+      }
+
+      function stableClientHash(input) {
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < input.length; index += 1) {
+          hash ^= input.charCodeAt(index);
+          hash = Math.imul(hash, 0x01000193);
+        }
+        return (hash >>> 0).toString(36).padStart(6, '0').slice(0, 8);
       }
 
       function normalizeHexColor(value) {
@@ -4018,7 +4167,7 @@ async function savePost() {
     return;
   }
   const title = titleInput.value.trim();
-  const postSlug = (postSlugInput.value.trim() || toSlug(title)).toLowerCase();
+  const postSlug = (postSlugInput.value.trim() || toSlug(title, true)).toLowerCase();
 
   if (!title) {
     setStatus('Title is required', true);
@@ -4262,9 +4411,9 @@ if (deletePostBtn) {
   });
 }
 
-titleInput.addEventListener('blur', () => {
+  titleInput.addEventListener('blur', () => {
   if (!postSlugInput.value.trim()) {
-    postSlugInput.value = toSlug(titleInput.value);
+    postSlugInput.value = toSlug(titleInput.value, true);
   }
   syncPreview();
 });
@@ -5021,6 +5170,7 @@ export function renderMarkdown(source) {
   let paragraph = [];
   let bulletItems = [];
   let orderedItems = [];
+  let quoteLines = [];
   let codeBlock = null;
   let mathBlock = null;
 
@@ -5049,6 +5199,15 @@ export function renderMarkdown(source) {
     orderedItems = [];
   };
 
+  const flushQuote = () => {
+    if (!quoteLines.length) {
+      return;
+    }
+    const quoteBody = quoteLines.map((line) => renderInline(line)).join("<br />");
+    blocks.push(`<blockquote>${quoteBody}</blockquote>`);
+    quoteLines = [];
+  };
+
   const flushCode = () => {
     if (!codeBlock) {
       return;
@@ -5075,6 +5234,7 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
+      flushQuote();
       flushMathBlock();
 
       if (codeBlock) {
@@ -5095,6 +5255,7 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
+      flushQuote();
 
       if (mathBlock) {
         flushMathBlock();
@@ -5113,6 +5274,7 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
+      flushQuote();
       continue;
     }
 
@@ -5121,6 +5283,7 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
+      flushQuote();
       blocks.push(`<div class="math-block">\\[${escapeHtml(singleLineMath[1].trim())}\\]</div>`);
       continue;
     }
@@ -5130,6 +5293,7 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
+      flushQuote();
       const level = heading[1].length;
       blocks.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
       continue;
@@ -5139,6 +5303,7 @@ export function renderMarkdown(source) {
     if (listItem) {
       flushParagraph();
       flushOrderedList();
+      flushQuote();
       bulletItems.push(listItem[1]);
       continue;
     }
@@ -5147,6 +5312,7 @@ export function renderMarkdown(source) {
     if (orderedItem) {
       flushParagraph();
       flushBulletList();
+      flushQuote();
       orderedItems.push(orderedItem[1]);
       continue;
     }
@@ -5155,6 +5321,7 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
+      flushQuote();
       blocks.push("<hr />");
       continue;
     }
@@ -5164,9 +5331,10 @@ export function renderMarkdown(source) {
       flushParagraph();
       flushBulletList();
       flushOrderedList();
-      blocks.push(`<blockquote>${renderInline(quote[1])}</blockquote>`);
+      quoteLines.push(quote[1]);
       continue;
     }
+    flushQuote();
 
     paragraph.push(line);
   }
@@ -5174,6 +5342,7 @@ export function renderMarkdown(source) {
   flushParagraph();
   flushBulletList();
   flushOrderedList();
+  flushQuote();
   flushCode();
   flushMathBlock();
 
@@ -5234,6 +5403,16 @@ function renderInline(value) {
   text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
   text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   text = text.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+
+  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, altText, url) => {
+    const rawUrl = String(url || "").trim();
+    if (!/^https?:\/\//i.test(rawUrl)) {
+      return `![${altText}](${escapeHtml(rawUrl)})`;
+    }
+    const safeUrl = escapeHtml(rawUrl);
+    const safeAlt = String(altText || "").trim();
+    return `<img src="${safeUrl}" alt="${safeAlt}" loading="lazy" referrerpolicy="no-referrer" />`;
+  });
 
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
     const rawUrl = String(url || "").trim();

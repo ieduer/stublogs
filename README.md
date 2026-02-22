@@ -41,7 +41,7 @@
 
 ## 註冊要求
 
-- 邀請碼：`suen`（透過 `INVITE_CODES` secret 設定）
+- 邀請碼：由管理員透過 `INVITE_CODES` secret 設定（不在倉庫明文保存）
 - slug 規則：
   - 全小寫
   - 僅允許 `a-z 0-9 -`
@@ -66,7 +66,7 @@
 - `GITHUB_OWNER`
 - `GITHUB_REPO`
 - `GITHUB_TOKEN`
-- `INVITE_CODES`（目前值：`suen`）
+- `INVITE_CODES`（邀請碼集合，不在倉庫明文保存）
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 

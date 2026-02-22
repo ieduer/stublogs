@@ -43,4 +43,6 @@ test('getHostSlug extracts first label', () => {
 test('slugifyValue normalizes titles', () => {
   assert.equal(slugifyValue('Hello World!!!'), 'hello-world');
   assert.equal(slugifyValue('  Bear  Style Editor  '), 'bear-style-editor');
+  assert.match(slugifyValue('中文標題'), /^post-[a-z0-9]{6,8}$/);
+  assert.equal(slugifyValue(''), '');
 });
