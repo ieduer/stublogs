@@ -36,14 +36,41 @@ const PASSWORD_SCRYPT_P = 1;
 const PASSWORD_SCRYPT_KEYLEN = 32;
 const PUBLIC_SSR_CACHE_CONTROL = "public, s-maxage=60, stale-while-revalidate=120";
 const PRIVATE_NO_CACHE_CONTROL = "private, no-cache";
+const REACTOR_COOKIE = "stublogs_reactor";
+const REACTOR_COOKIE_TTL_SECONDS = 60 * 60 * 24 * 365 * 2;
+const HOME_VIEW_KEY = "__home__";
 
 const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_MAX_ATTEMPTS = 5;
 const COMMENT_RATE_WINDOW_MS = 60 * 1000;
 const COMMENT_RATE_MAX_ATTEMPTS = 6;
+const REACTION_RATE_WINDOW_MS = 60 * 1000;
+const REACTION_RATE_MAX_ATTEMPTS = 30;
 let commentsTableReadyPromise = null;
 let rateLimitsTableReadyPromise = null;
+let reactionsTableReadyPromise = null;
+let viewsTableReadyPromise = null;
 const postsColumnsPromiseByDb = new WeakMap();
+
+const REACTION_PRESETS = Object.freeze([
+  { key: "lion", icon: "🦁", label: "獅王" },
+  { key: "dragon", icon: "🐉", label: "金龍" },
+  { key: "hummingbird", icon: "🐦", label: "蜂鳥" },
+  { key: "deer", icon: "🦌", label: "冰鹿" },
+  { key: "eagle", icon: "🦅", label: "蒼鷹" },
+  { key: "wolf", icon: "🐺", label: "紫狼" },
+  { key: "unicorn", icon: "🦄", label: "獨角獸" },
+  { key: "phoenix", icon: "🐦‍🔥", label: "鳳凰" },
+  { key: "orca", icon: "🐋", label: "逆戟鯨" },
+  { key: "fire", icon: "🔥", label: "燃" },
+  { key: "rocket", icon: "🚀", label: "起飛" },
+  { key: "spark", icon: "✨", label: "閃亮" },
+  { key: "mindblown", icon: "🤯", label: "炸裂" },
+  { key: "respect", icon: "🫶", label: "超讚" },
+]);
+const REACTION_PRESET_MAP = new Map(
+  REACTION_PRESETS.map((item) => [item.key, item])
+);
 
 export default {
   async fetch(request, env, ctx) {
@@ -279,22 +306,34 @@ async function handleRequest(request, env, ctx) {
   if (path === "/") {
     const siteConfig = await getSiteConfig(env, site);
     const page = parsePositiveInt(url.searchParams.get("page"), 1, 1, 9999);
-    const [postsPage, sitePages, communitySites, campusFeed] = await Promise.all([
+    const [homeViewCount, postsPage, sitePages, communitySites, campusFeed] = await Promise.all([
+      incrementPageViewCount(env, site.id, "home", HOME_VIEW_KEY),
       listPostsPage(env, site.id, page, POSTS_PAGE_SIZE),
       listSitePages(env, site.id, 20),
       siteConfig.hideCommunitySites ? Promise.resolve([]) : listCommunitySites(env, site.slug, 12),
       siteConfig.hideCampusFeed ? Promise.resolve([]) : listCampusFeed(env, site.id, 18),
     ]);
+    const postViewMap = await listPageViewCounts(
+      env,
+      site.id,
+      "post",
+      postsPage.posts.map((post) => post.postSlug)
+    );
+    const postsWithViews = postsPage.posts.map((post) => ({
+      ...post,
+      viewCount: Math.max(Number(postViewMap.get(post.postSlug) || 0), 0),
+    }));
     return html(
       renderSiteHomePage(
         site,
         siteConfig,
-        postsPage.posts,
+        postsWithViews,
         sitePages,
         communitySites,
         campusFeed,
         baseDomain,
-        postsPage
+        postsPage,
+        homeViewCount
       ),
       200,
       { "Cache-Control": PUBLIC_SSR_CACHE_CONTROL }
@@ -330,9 +369,14 @@ async function handleRequest(request, env, ctx) {
       listSitePages(env, site.id, 20),
     ]);
     const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
-    const commentsData = siteConfig.commentsEnabled
-      ? await listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
-      : { comments: [], page: 1, totalPages: 1, total: 0 };
+    const [commentsData, postViewCount] = await Promise.all([
+      siteConfig.commentsEnabled
+        ? listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
+        : Promise.resolve({ comments: [], page: 1, totalPages: 1, total: 0 }),
+      listPageViewCounts(env, site.id, "post", [post.postSlug]).then(
+        (map) => Math.max(Number(map.get(post.postSlug) || 0), 0)
+      ),
+    ]);
     const articleHtml = renderMarkdown(file.content);
     return html(
       renderPostPage(site, siteConfig, post, articleHtml, communitySites, sitePages, baseDomain, {
@@ -343,6 +387,8 @@ async function handleRequest(request, env, ctx) {
         commentsEnabled: siteConfig.commentsEnabled,
         commentsTotal: commentsData.total,
         commentBasePath: `/preview/${encodeURIComponent(post.postSlug)}`,
+        postViewCount,
+        reactionsEnabled: false,
       }),
       200
     );
@@ -376,11 +422,16 @@ async function handleRequest(request, env, ctx) {
     listSitePages(env, site.id, 20),
   ]);
   const commentPage = parsePositiveInt(url.searchParams.get("cpage"), 1, 1, 9999);
-  const commentsData = siteConfig.commentsEnabled
-    ? await listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
-    : { comments: [], page: 1, totalPages: 1, total: 0 };
+  const reactor = resolveReactorToken(request);
+  const [commentsData, postViewCount, reactionSnapshot] = await Promise.all([
+    siteConfig.commentsEnabled
+      ? listPostComments(env, site.id, post.postSlug, commentPage, COMMENTS_PAGE_SIZE)
+      : Promise.resolve({ comments: [], page: 1, totalPages: 1, total: 0 }),
+    incrementPageViewCount(env, site.id, "post", post.postSlug),
+    listPostReactionSnapshot(env, site.id, post.postSlug, reactor.token),
+  ]);
   const articleHtml = renderMarkdown(file.content);
-  return html(
+  let response = html(
     renderPostPage(site, siteConfig, post, articleHtml, communitySites, sitePages, baseDomain, {
       comments: commentsData.comments,
       commentsPage: commentsData.page,
@@ -388,10 +439,16 @@ async function handleRequest(request, env, ctx) {
       commentsEnabled: siteConfig.commentsEnabled,
       commentsTotal: commentsData.total,
       commentBasePath: `/${encodeURIComponent(post.postSlug)}`,
+      postViewCount,
+      reactionSnapshot,
     }),
     200,
     { "Cache-Control": PUBLIC_SSR_CACHE_CONTROL }
   );
+  if (reactor.shouldSetCookie) {
+    response = withCookie(response, buildReactorCookie(reactor.token));
+  }
+  return response;
 }
 
 async function handleApi(request, env, ctx, context) {
@@ -953,6 +1010,112 @@ async function handleApi(request, env, ctx, context) {
       },
       200
     );
+  }
+
+  if (request.method === "GET" && path === "/api/reactions") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const postSlug = String(url.searchParams.get("postSlug") || "").trim().toLowerCase();
+    if (!postSlug) {
+      return json({ error: "Missing post slug" }, 400);
+    }
+    const post = await getPostMeta(env, site.id, postSlug, false);
+    if (!post) {
+      return json({ error: "Post not found" }, 404);
+    }
+    const reactor = resolveReactorToken(request);
+    const snapshot = await listPostReactionSnapshot(env, site.id, postSlug, reactor.token);
+    let response = json(
+      {
+        ok: true,
+        postSlug,
+        total: snapshot.total,
+        selectedKeys: snapshot.selectedKeys,
+        reactions: snapshot.items.map((item) => ({
+          key: item.key,
+          icon: item.icon,
+          label: item.label,
+          count: item.count,
+          selected: item.selected,
+        })),
+      },
+      200
+    );
+    if (reactor.shouldSetCookie) {
+      response = withCookie(response, buildReactorCookie(reactor.token));
+    }
+    return response;
+  }
+
+  if (request.method === "POST" && path === "/api/reactions") {
+    if (!hostSlug) {
+      return json({ error: "Missing site context" }, 400);
+    }
+    const site = await getSiteBySlug(env, hostSlug);
+    if (!site) {
+      return json({ error: "Site not found" }, 404);
+    }
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const reactionRate = await consumeRateLimit(
+      env,
+      `${clientIp}:${site.slug}:reactions`,
+      REACTION_RATE_WINDOW_MS,
+      REACTION_RATE_MAX_ATTEMPTS,
+      ctx
+    );
+    if (!reactionRate.allowed) {
+      return json(
+        { error: "Too many reaction requests, please try later" },
+        429,
+        { "Retry-After": String(Math.ceil(reactionRate.retryAfterMs / 1000)) }
+      );
+    }
+
+    const body = await readJson(request);
+    const postSlug = String(body.postSlug || "").trim().toLowerCase();
+    const reactionKey = sanitizeReactionKey(body.reactionKey || "");
+    if (!postSlug) {
+      return json({ error: "Missing post slug" }, 400);
+    }
+    if (!reactionKey) {
+      return json({ error: "Invalid reaction key" }, 400);
+    }
+
+    const post = await getPostMeta(env, site.id, postSlug, false);
+    if (!post) {
+      return json({ error: "Post not found" }, 404);
+    }
+
+    const reactor = resolveReactorToken(request);
+    const active = await togglePostReaction(env, site.id, postSlug, reactionKey, reactor.token);
+    const snapshot = await listPostReactionSnapshot(env, site.id, postSlug, reactor.token);
+    let response = json(
+      {
+        ok: true,
+        postSlug,
+        reactionKey,
+        active,
+        total: snapshot.total,
+        selectedKeys: snapshot.selectedKeys,
+        reactions: snapshot.items.map((item) => ({
+          key: item.key,
+          icon: item.icon,
+          label: item.label,
+          count: item.count,
+          selected: item.selected,
+        })),
+      },
+      200
+    );
+    if (reactor.shouldSetCookie) {
+      response = withCookie(response, buildReactorCookie(reactor.token));
+    }
+    return response;
   }
 
   if (request.method === "GET" && path === "/api/comments") {
@@ -1736,6 +1899,63 @@ async function ensureCommentsTable(env) {
   return commentsTableReadyPromise;
 }
 
+async function ensureReactionsTable(env) {
+  if (!reactionsTableReadyPromise) {
+    reactionsTableReadyPromise = (async () => {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS reactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          site_id INTEGER NOT NULL,
+          post_slug TEXT NOT NULL,
+          reaction_key TEXT NOT NULL,
+          actor_token TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          UNIQUE(site_id, post_slug, reaction_key, actor_token),
+          FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_reactions_site_post
+         ON reactions(site_id, post_slug, created_at DESC)`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_reactions_actor
+         ON reactions(site_id, post_slug, actor_token)`
+      ).run();
+    })().catch((error) => {
+      reactionsTableReadyPromise = null;
+      throw error;
+    });
+  }
+  return reactionsTableReadyPromise;
+}
+
+async function ensureViewsTable(env) {
+  if (!viewsTableReadyPromise) {
+    viewsTableReadyPromise = (async () => {
+      await env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS page_views (
+          site_id INTEGER NOT NULL,
+          resource_type TEXT NOT NULL,
+          resource_key TEXT NOT NULL,
+          view_count INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          PRIMARY KEY(site_id, resource_type, resource_key),
+          FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+        )`
+      ).run();
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_page_views_site_type
+         ON page_views(site_id, resource_type, updated_at DESC)`
+      ).run();
+    })().catch((error) => {
+      viewsTableReadyPromise = null;
+      throw error;
+    });
+  }
+  return viewsTableReadyPromise;
+}
+
 async function ensureRateLimitsTable(env) {
   if (!rateLimitsTableReadyPromise) {
     rateLimitsTableReadyPromise = (async () => {
@@ -2025,6 +2245,218 @@ async function deleteComment(env, siteId, commentId) {
     .bind(commentId, siteId)
     .run();
   return Number(result.meta?.changes || 0) > 0;
+}
+
+function normalizeViewResourceType(value) {
+  const type = String(value || "").trim().toLowerCase();
+  if (type === "home") {
+    return "home";
+  }
+  return "post";
+}
+
+function normalizeViewResourceKey(resourceType, value) {
+  if (resourceType === "home") {
+    return HOME_VIEW_KEY;
+  }
+  const slug = String(value || "").trim().toLowerCase();
+  if (!slug) {
+    return "";
+  }
+  if (slug.length > 120) {
+    return slug.slice(0, 120);
+  }
+  return slug;
+}
+
+function formatViewCount(value) {
+  const safe = Math.max(Number(value) || 0, 0);
+  return new Intl.NumberFormat("zh-Hant").format(safe);
+}
+
+async function incrementPageViewCount(env, siteId, resourceType, resourceKey) {
+  await ensureViewsTable(env);
+  const normalizedType = normalizeViewResourceType(resourceType);
+  const normalizedKey = normalizeViewResourceKey(normalizedType, resourceKey);
+  if (!normalizedKey) {
+    return 0;
+  }
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO page_views (site_id, resource_type, resource_key, view_count, updated_at)
+     VALUES (?, ?, ?, 1, ?)
+     ON CONFLICT(site_id, resource_type, resource_key)
+     DO UPDATE SET
+       view_count = page_views.view_count + 1,
+       updated_at = excluded.updated_at`
+  )
+    .bind(siteId, normalizedType, normalizedKey, now)
+    .run();
+
+  const row = await env.DB.prepare(
+    `SELECT view_count AS viewCount
+     FROM page_views
+     WHERE site_id = ? AND resource_type = ? AND resource_key = ?
+     LIMIT 1`
+  )
+    .bind(siteId, normalizedType, normalizedKey)
+    .first();
+
+  return Math.max(Number(row?.viewCount || 0), 0);
+}
+
+async function listPageViewCounts(env, siteId, resourceType, resourceKeys = []) {
+  await ensureViewsTable(env);
+  const normalizedType = normalizeViewResourceType(resourceType);
+  const uniqueKeys = Array.from(
+    new Set(
+      resourceKeys
+        .map((item) => normalizeViewResourceKey(normalizedType, item))
+        .filter(Boolean)
+    )
+  );
+  if (!uniqueKeys.length) {
+    return new Map();
+  }
+  const placeholders = uniqueKeys.map(() => "?").join(", ");
+  const query = `SELECT resource_key AS resourceKey, view_count AS viewCount
+    FROM page_views
+    WHERE site_id = ? AND resource_type = ? AND resource_key IN (${placeholders})`;
+  const result = await env.DB.prepare(query)
+    .bind(siteId, normalizedType, ...uniqueKeys)
+    .all();
+  const viewMap = new Map();
+  for (const row of result.results || []) {
+    const key = String(row.resourceKey || "");
+    if (!key) {
+      continue;
+    }
+    viewMap.set(key, Math.max(Number(row.viewCount || 0), 0));
+  }
+  return viewMap;
+}
+
+function sanitizeActorToken(value) {
+  const token = String(value || "").trim().toLowerCase();
+  if (!token) {
+    return "";
+  }
+  if (!/^[a-f0-9]{20,64}$/.test(token)) {
+    return "";
+  }
+  return token.slice(0, 64);
+}
+
+function resolveReactorToken(request) {
+  const cookies = parseCookies(request.headers.get("cookie") || "");
+  const existing = sanitizeActorToken(cookies[REACTOR_COOKIE]);
+  if (existing) {
+    return { token: existing, shouldSetCookie: false };
+  }
+  return { token: randomHex(16), shouldSetCookie: true };
+}
+
+function buildReactorCookie(token) {
+  return `${REACTOR_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${REACTOR_COOKIE_TTL_SECONDS}`;
+}
+
+function sanitizeReactionKey(value) {
+  const key = String(value || "").trim().toLowerCase();
+  return REACTION_PRESET_MAP.has(key) ? key : "";
+}
+
+function buildReactionSnapshot(countsByKey = new Map(), selectedKeys = new Set()) {
+  const normalizedSelected = new Set(
+    Array.from(selectedKeys || []).map((item) => sanitizeReactionKey(item)).filter(Boolean)
+  );
+  const items = REACTION_PRESETS.map((preset) => {
+    const count = Math.max(Number(countsByKey.get(preset.key) || 0), 0);
+    return {
+      ...preset,
+      count,
+      selected: normalizedSelected.has(preset.key),
+    };
+  });
+  return {
+    items,
+    total: items.reduce((sum, item) => sum + item.count, 0),
+    selectedKeys: items.filter((item) => item.selected).map((item) => item.key),
+  };
+}
+
+async function listPostReactionSnapshot(env, siteId, postSlug, actorToken = "") {
+  await ensureReactionsTable(env);
+  const countsResult = await env.DB.prepare(
+    `SELECT reaction_key AS reactionKey, COUNT(*) AS total
+     FROM reactions
+     WHERE site_id = ? AND post_slug = ?
+     GROUP BY reaction_key`
+  )
+    .bind(siteId, postSlug)
+    .all();
+  const countsMap = new Map();
+  for (const row of countsResult.results || []) {
+    const key = sanitizeReactionKey(row.reactionKey);
+    if (!key) {
+      continue;
+    }
+    countsMap.set(key, Math.max(Number(row.total || 0), 0));
+  }
+
+  const normalizedActorToken = sanitizeActorToken(actorToken);
+  const selected = new Set();
+  if (normalizedActorToken) {
+    const selectedResult = await env.DB.prepare(
+      `SELECT reaction_key AS reactionKey
+       FROM reactions
+       WHERE site_id = ? AND post_slug = ? AND actor_token = ?`
+    )
+      .bind(siteId, postSlug, normalizedActorToken)
+      .all();
+    for (const row of selectedResult.results || []) {
+      const key = sanitizeReactionKey(row.reactionKey);
+      if (key) {
+        selected.add(key);
+      }
+    }
+  }
+  return buildReactionSnapshot(countsMap, selected);
+}
+
+async function togglePostReaction(env, siteId, postSlug, reactionKey, actorToken) {
+  await ensureReactionsTable(env);
+  const normalizedReactionKey = sanitizeReactionKey(reactionKey);
+  const normalizedActorToken = sanitizeActorToken(actorToken);
+  if (!normalizedReactionKey || !normalizedActorToken) {
+    return false;
+  }
+
+  const existing = await env.DB.prepare(
+    `SELECT id
+     FROM reactions
+     WHERE site_id = ? AND post_slug = ? AND reaction_key = ? AND actor_token = ?
+     LIMIT 1`
+  )
+    .bind(siteId, postSlug, normalizedReactionKey, normalizedActorToken)
+    .first();
+
+  if (existing) {
+    await env.DB.prepare(
+      `DELETE FROM reactions
+       WHERE site_id = ? AND post_slug = ? AND reaction_key = ? AND actor_token = ?`
+    )
+      .bind(siteId, postSlug, normalizedReactionKey, normalizedActorToken)
+      .run();
+    return false;
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO reactions (site_id, post_slug, reaction_key, actor_token, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  )
+    .bind(siteId, postSlug, normalizedReactionKey, normalizedActorToken, new Date().toISOString())
+    .run();
+  return true;
 }
 
 async function getPostMeta(env, siteId, postSlug, includeDrafts = false) {
@@ -3396,7 +3828,8 @@ function renderSiteHomePage(
   communitySites,
   campusFeed,
   baseDomain,
-  postsPage = null
+  postsPage = null,
+  homeViewCount = 0
 ) {
   const heading = siteConfig.heroTitle || site.displayName;
   const subtitle = siteConfig.heroSubtitle || site.description || "";
@@ -3422,7 +3855,7 @@ function renderSiteHomePage(
           <li class="post-item">
             <a href="/${encodeURIComponent(post.postSlug)}" class="post-link">${escapeHtml(post.title)}</a>
             <p class="muted">${escapeHtml(post.description || "")}</p>
-            <small>${escapeHtml(formatDate(post.updatedAt))}</small>
+            <small>${escapeHtml(formatDate(post.updatedAt))} · 訪問 ${escapeHtml(formatViewCount(post.viewCount))}</small>
           </li>
         `
       )
@@ -3468,6 +3901,7 @@ function renderSiteHomePage(
           <p class="eyebrow">${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
           <h1>${escapeHtml(heading)}</h1>
           <p class="muted">${escapeHtml(subtitle)}</p>
+          <p class="muted">首頁訪問：${escapeHtml(formatViewCount(homeViewCount))}</p>
         </div>
         <div class="row-actions">
           <a class="link-button" href="/admin">Admin</a>
@@ -3598,6 +4032,19 @@ export function renderPostPage(
     options.commentBasePath || `/${encodeURIComponent(post.postSlug)}`
   );
   const commentsTotal = Number(options.commentsTotal || comments.length || 0);
+  const postViewCount = Math.max(Number(options.postViewCount || 0), 0);
+  const reactionsEnabled = options.reactionsEnabled !== false && !previewMode;
+  const reactionSnapshot = buildReactionSnapshot(
+    new Map(
+      Array.isArray(options.reactionSnapshot?.items)
+        ? options.reactionSnapshot.items.map((item) => [
+          sanitizeReactionKey(item.key),
+          Math.max(Number(item.count || 0), 0),
+        ]).filter((entry) => Boolean(entry[0]))
+        : []
+    ),
+    new Set(Array.isArray(options.reactionSnapshot?.selectedKeys) ? options.reactionSnapshot.selectedKeys : [])
+  );
   const showCommunityPanel = !siteConfig.hideCommunitySites;
   const canonicalPostUrl = `https://${site.slug}.${baseDomain}/${encodeURIComponent(post.postSlug)}`;
   const modeNav = renderSiteModeNav(
@@ -3638,6 +4085,33 @@ export function renderPostPage(
       </nav>`
     : "";
 
+  const reactionsPanel = reactionsEnabled
+    ? `<section id="reactions" class="panel wide reaction-panel" data-post-slug="${escapeHtml(post.postSlug)}">
+        <div class="reaction-head">
+          <h2>點贊反應</h2>
+          <p class="muted">總反應：<span id="reaction-total">${reactionSnapshot.total}</span></p>
+        </div>
+        <div class="reaction-grid">
+          ${reactionSnapshot.items
+        .map((item) => `
+            <button
+              type="button"
+              class="reaction-btn ${item.selected ? "active" : ""}"
+              data-reaction-key="${escapeHtml(item.key)}"
+              aria-pressed="${item.selected ? "true" : "false"}"
+              title="${escapeHtml(item.label)}"
+            >
+              <span class="reaction-icon">${escapeHtml(item.icon)}</span>
+              <span class="reaction-label">${escapeHtml(item.label)}</span>
+              <span class="reaction-count" data-role="count">${item.count}</span>
+            </button>
+          `)
+        .join("")}
+        </div>
+        <p id="reaction-status" class="muted"></p>
+      </section>`
+    : "";
+
   // Estimate read time (~400 chars/min for Chinese)
   const charCount = articleHtml.replace(/<[^>]+>/g, "").length;
   const readMinutes = Math.max(1, Math.round(charCount / 400));
@@ -3652,7 +4126,7 @@ export function renderPostPage(
       site.slug
     )}.${escapeHtml(baseDomain)} ${Number(post.isPage) === 1 ? '<span class="preview-badge">Page</span>' : ''} ${previewMode ? '<span class="preview-badge">Preview</span>' : ''}</p>
         <h1>${escapeHtml(post.title)}</h1>
-        <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span></p>
+        <p class="muted">${escapeHtml(formatDate(post.updatedAt))} <span class="read-time">· ${readMinutes} min read</span> <span class="read-time">· 訪問 ${escapeHtml(formatViewCount(postViewCount))}</span></p>
         ${renderThemeControlDock("front")}
         ${modeNav}
         <div class="article-body">${articleHtml}</div>
@@ -3664,6 +4138,7 @@ export function renderPostPage(
       </aside>
       ` : ''}
     </section>
+    ${reactionsPanel}
     ${commentsEnabled ? `
     <section id="comments" class="panel wide comment-panel">
       <h2>留言 (${commentsTotal})</h2>
@@ -3700,6 +4175,96 @@ export function renderPostPage(
         if (backTop) {
           backTop.addEventListener('click', function() {
             window.scrollTo({ top: 0, behavior: 'smooth' });
+          });
+        }
+
+        const reactionPanel = document.getElementById('reactions');
+        if (reactionPanel) {
+          const reactionStatusEl = document.getElementById('reaction-status');
+          const reactionTotalEl = document.getElementById('reaction-total');
+          const reactionButtons = Array.from(
+            reactionPanel.querySelectorAll('.reaction-btn[data-reaction-key]')
+          );
+          let isSubmittingReaction = false;
+
+          function setReactionStatus(message, isError) {
+            if (!reactionStatusEl) return;
+            reactionStatusEl.textContent = message;
+            reactionStatusEl.style.color = isError ? 'var(--danger)' : 'var(--muted)';
+          }
+
+          function applyReactionSnapshot(snapshot) {
+            const selected = new Set(Array.isArray(snapshot.selectedKeys) ? snapshot.selectedKeys : []);
+            const counts = {};
+            const items = Array.isArray(snapshot.reactions) ? snapshot.reactions : [];
+            for (const item of items) {
+              if (!item || !item.key) continue;
+              counts[item.key] = Math.max(Number(item.count || 0), 0);
+            }
+            let total = Math.max(Number(snapshot.total || 0), 0);
+            if (!Number.isFinite(total) || total < 0) {
+              total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+            }
+
+            reactionButtons.forEach((button) => {
+              const key = String(button.getAttribute('data-reaction-key') || '');
+              const countEl = button.querySelector('[data-role="count"]');
+              if (countEl) {
+                countEl.textContent = String(Math.max(Number(counts[key] || 0), 0));
+              }
+              const active = selected.has(key);
+              button.classList.toggle('active', active);
+              button.setAttribute('aria-pressed', active ? 'true' : 'false');
+            });
+
+            if (reactionTotalEl) {
+              reactionTotalEl.textContent = String(total);
+            }
+          }
+
+          reactionPanel.addEventListener('click', async (event) => {
+            const target = event.target;
+            if (!(target instanceof HTMLElement)) {
+              return;
+            }
+            const button = target.closest('.reaction-btn[data-reaction-key]');
+            if (!button || isSubmittingReaction) {
+              return;
+            }
+            const reactionKey = String(button.getAttribute('data-reaction-key') || '');
+            if (!reactionKey) {
+              return;
+            }
+
+            isSubmittingReaction = true;
+            reactionButtons.forEach((item) => {
+              item.disabled = true;
+            });
+            setReactionStatus('更新反應中...', false);
+            try {
+              const response = await fetch('/api/reactions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  postSlug: ${JSON.stringify(post.postSlug)},
+                  reactionKey,
+                }),
+              });
+              const data = await response.json();
+              if (!response.ok) {
+                setReactionStatus(data.error || '更新反應失敗', true);
+                return;
+              }
+              applyReactionSnapshot(data);
+              setReactionStatus('反應已更新', false);
+            } catch (error) {
+              setReactionStatus(error.message || '更新反應失敗', true);
+            } finally {
+              isSubmittingReaction = false;
+              reactionButtons.forEach((item) => {
+                item.disabled = false;
+              });
+            }
           });
         }
 
@@ -3745,7 +4310,7 @@ export function renderPostPage(
             const createdAt = comment.createdAt
               ? new Date(comment.createdAt).toLocaleString('zh-Hant')
               : new Date().toLocaleString('zh-Hant');
-            const safeContent = escapeHtml(comment.content || '').replace(/\n/g, '<br />');
+            const safeContent = escapeHtml(comment.content || '').split('\n').join('<br />');
 
             const item = document.createElement('li');
             item.className = 'comment-item';
@@ -5302,6 +5867,15 @@ button:active,.link-button:active{transform:translateY(0)}
 .article-body .katex{max-width:100%}
 .article-body .katex-display > .katex{max-width:100%}
 .read-time{font-family:var(--font-mono);font-size:.78rem;color:var(--muted);margin-left:.5rem}
+.reaction-panel{margin-top:1rem;display:grid;gap:.7rem}
+.reaction-head{display:flex;align-items:center;justify-content:space-between;gap:.8rem;flex-wrap:wrap}
+.reaction-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.5rem}
+.reaction-btn{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:.45rem;text-align:left;padding:.5rem .6rem;min-height:42px;background:rgba(255,255,255,.55);color:var(--ink);border:1px solid var(--line)}
+.reaction-btn:hover{border-color:var(--accent);transform:none}
+.reaction-btn.active{border-color:var(--accent);background:var(--accent-glow)}
+.reaction-icon{font-size:1.15rem;line-height:1}
+.reaction-label{font-family:var(--font-mono);font-size:.76rem;color:var(--ink-2)}
+.reaction-count{font-family:var(--font-mono);font-size:.78rem;padding:.12rem .42rem;border-radius:999px;border:1px solid var(--line);background:var(--panel)}
 .comment-panel{margin-top:1rem}
 .comment-list{list-style:none;margin:1rem 0 0;padding:0;display:grid;gap:.75rem}
 .comment-list.compact{gap:.5rem}

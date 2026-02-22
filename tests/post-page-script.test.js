@@ -113,3 +113,41 @@ test("post page mode nav follows Home/Now/Projects/Blog order", () => {
   assert.ok(nowPos < projectsPos);
   assert.ok(projectsPos < blogPos);
 });
+
+test("post page renders reactions and view counter", () => {
+  const html = renderPostPage(
+    buildSite(),
+    buildSiteConfig(),
+    {
+      postSlug: "hello-world",
+      title: "Hello World",
+      description: "",
+      published: 1,
+      isPage: 0,
+      updatedAt: new Date().toISOString(),
+    },
+    "<p>content</p>",
+    [],
+    [{ postSlug: "home", title: "Home", updatedAt: "2026-02-21T00:00:00.000Z" }],
+    "bdfz.net",
+    {
+      commentsEnabled: true,
+      comments: [],
+      commentsTotal: 0,
+      commentsPage: 1,
+      commentsTotalPages: 1,
+      commentBasePath: "/hello-world",
+      postViewCount: 1234,
+      reactionSnapshot: {
+        items: [{ key: "lion", count: 2 }],
+        selectedKeys: ["lion"],
+      },
+    }
+  );
+
+  assert.match(html, /訪問 1,234/);
+  assert.match(html, /id="reactions"/);
+  assert.match(html, /data-reaction-key="lion"/);
+  assert.match(html, /class="reaction-btn active"/);
+  assert.match(html, /\/api\/reactions/);
+});
