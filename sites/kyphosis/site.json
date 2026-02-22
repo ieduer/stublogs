@@ -5,7 +5,7 @@
   "heroTitle": "欢迎来到SOYUZ基站",
   "heroSubtitle": "我的轮廓过于模糊，我的形体过于离散。",
   "colorTheme": "ocean",
-  "footerNote": "加载完毕，请确认您的电波稳定。",
+  "footerNote": "加载完毕，请确认您的信号持续稳定，我们将定向发送A–class记忆清除讯号来定位您的坐标并实施记忆清除，感谢您的参与————SOYUZ研究所",
   "customCss": "",
   "faviconUrl": "https://img.bdfz.net/20250503004.webp",
   "headerLinks": [],
@@ -13,6 +13,6 @@
   "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-22T04:14:36.294Z",
-  "updatedAt": "2026-02-22T04:21:19.690Z",
+  "updatedAt": "2026-02-22T04:24:19.861Z",
   "exportVersion": 3
 }
