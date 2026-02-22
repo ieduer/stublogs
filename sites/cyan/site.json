@@ -10,7 +10,7 @@
   "faviconUrl": "https://www.tachyon.moe/image/cyan.png",
   "headerLinks": [
     {
-      "label": "<div>123</div>",
+      "label": "</a>123<a>",
       "url": "https://cyan.bdfz.net/"
     }
   ],
@@ -18,6 +18,6 @@
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-22T18:48:47.821Z",
+  "updatedAt": "2026-02-22T18:49:21.186Z",
   "exportVersion": 3
 }
