@@ -3032,13 +3032,59 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
           const siteInput = document.getElementById('comment-site');
           const contentInput = document.getElementById('comment-content');
           const submitBtn = document.getElementById('comment-submit');
+          const commentsSection = document.getElementById('comments');
+          const commentsListEl = commentsSection ? commentsSection.querySelector('.comment-list') : null;
+          const commentsTitleEl = commentsSection ? commentsSection.querySelector('h2') : null;
           const storageKey = 'stublogs-comment-profile:' + location.host;
+          let isSubmittingComment = false;
 
           try {
             const profile = JSON.parse(localStorage.getItem(storageKey) || '{}');
             if (profile.authorName) authorInput.value = profile.authorName;
             if (profile.authorSiteSlug) siteInput.value = profile.authorSiteSlug;
           } catch {}
+
+          function escapeHtml(value) {
+            return String(value || '')
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;')
+              .replace(/'/g, '&#39;');
+          }
+
+          function addCommentToList(comment) {
+            if (!commentsListEl || !comment) return;
+
+            const placeholder = commentsListEl.querySelector('.comment-item.muted');
+            if (placeholder) {
+              placeholder.remove();
+            }
+
+            const author = comment.authorSiteSlug
+              ? comment.authorName + ' · ' + comment.authorSiteSlug + '.bdfz.net'
+              : comment.authorName;
+            const createdAt = comment.createdAt
+              ? new Date(comment.createdAt).toLocaleString('zh-Hant')
+              : new Date().toLocaleString('zh-Hant');
+            const safeContent = escapeHtml(comment.content || '').replace(/\n/g, '<br />');
+
+            const item = document.createElement('li');
+            item.className = 'comment-item';
+            item.innerHTML =
+              '<p class="comment-meta">' + escapeHtml(author) + ' · ' + escapeHtml(createdAt) + '</p>' +
+              '<p class="comment-content">' + safeContent + '</p>';
+
+            commentsListEl.prepend(item);
+          }
+
+          function bumpCommentCount() {
+            if (!commentsTitleEl) return;
+            const text = commentsTitleEl.textContent || '';
+            const match = text.match(/\((\d+)\)/);
+            const current = match ? Number(match[1]) : 0;
+            commentsTitleEl.textContent = '留言 (' + (current + 1) + ')';
+          }
 
           function setCommentStatus(message, isError) {
             statusEl.textContent = message;
@@ -3047,6 +3093,9 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
 
           form.addEventListener('submit', async (event) => {
             event.preventDefault();
+            if (isSubmittingComment) {
+              return;
+            }
             const payload = {
               postSlug: ${JSON.stringify(post.postSlug)},
               authorName: authorInput.value.trim(),
@@ -3058,6 +3107,7 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
               return;
             }
 
+            isSubmittingComment = true;
             submitBtn.disabled = true;
             setCommentStatus('送出中...', false);
             try {
@@ -3071,15 +3121,30 @@ function renderPostPage(site, siteConfig, post, articleHtml, communitySites, bas
                 setCommentStatus(data.error || '留言送出失敗', true);
                 return;
               }
-              localStorage.setItem(storageKey, JSON.stringify({
-                authorName: payload.authorName,
-                authorSiteSlug: payload.authorSiteSlug,
-              }));
-              setCommentStatus('留言成功，正在更新列表...', false);
-              location.href = ${JSON.stringify(commentBasePath)} + '#comments';
+              try {
+                localStorage.setItem(storageKey, JSON.stringify({
+                  authorName: payload.authorName,
+                  authorSiteSlug: payload.authorSiteSlug,
+                }));
+              } catch {}
+
+              const createdComment = data && data.comment
+                ? data.comment
+                : {
+                  authorName: payload.authorName,
+                  authorSiteSlug: payload.authorSiteSlug,
+                  content: payload.content,
+                  createdAt: new Date().toISOString(),
+                };
+              addCommentToList(createdComment);
+              bumpCommentCount();
+              contentInput.value = '';
+              contentInput.focus();
+              setCommentStatus('留言成功，已更新列表。', false);
             } catch (error) {
               setCommentStatus(error.message || '留言送出失敗', true);
             } finally {
+              isSubmittingComment = false;
               submitBtn.disabled = false;
             }
           });
@@ -3159,6 +3224,7 @@ export function renderAdminPage(site, siteConfig, authed, baseDomain) {
           <p class="muted">${escapeHtml(site.slug)}.${escapeHtml(baseDomain)}</p>
         </div>
         <div class="row-actions">
+          <a class="link-button" href="/" target="_blank" rel="noreferrer noopener">Frontend</a>
           <button id="new-post" class="link-button" type="button">New</button>
           <button id="logout" class="link-button" type="button">Logout</button>
           <a class="link-button" href="/api/export">Export</a>
