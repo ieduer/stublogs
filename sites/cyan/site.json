@@ -6,13 +6,13 @@
   "heroSubtitle": "",
   "colorTheme": "graphite",
   "footerNote": "我也不知道应该写点什么...",
-  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n}\n.panel {\n    background: #1e1e1e !important;\n}",
+  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n}\n.panel {\n    background: #1e1e1e !important;\n}\n* {\n    --accent: rgb(63 81 181)\n}",
   "faviconUrl": "https://www.tachyon.moe/image/cyan.png",
   "headerLinks": [],
   "hideCommunitySites": true,
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-22T09:57:07.284Z",
+  "updatedAt": "2026-02-22T09:58:19.672Z",
   "exportVersion": 3
 }
