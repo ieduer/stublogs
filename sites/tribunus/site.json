@@ -1,0 +1,18 @@
+{
+  "slug": "tribunus",
+  "displayName": "保民官",
+  "description": "保护平民,否决官员的古代职位",
+  "heroTitle": "",
+  "heroSubtitle": "",
+  "colorTheme": "default",
+  "footerNote": "",
+  "customCss": "",
+  "faviconUrl": "https://img.bdfz.net/20250503004.webp",
+  "headerLinks": [],
+  "hideCommunitySites": false,
+  "hideCampusFeed": false,
+  "commentsEnabled": true,
+  "createdAt": "2026-02-22T04:59:45.672Z",
+  "updatedAt": "2026-02-22T04:59:45.672Z",
+  "exportVersion": 3
+}
