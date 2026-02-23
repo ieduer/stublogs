@@ -2,9 +2,9 @@
   "slug": "ecclesia",
   "displayName": "所想的，和尽可能说出来的",
   "description": "月が綺麗ねと言われたい！",
-  "heroTitle": "",
-  "heroSubtitle": "",
-  "colorTheme": "default",
+  "heroTitle": "好乱好乱",
+  "heroSubtitle": "整理什么的开学再说吧",
+  "colorTheme": "violet",
   "footerNote": "",
   "customCss": "",
   "faviconUrl": "https://img.bdfz.net/20250503004.webp",
@@ -13,6 +13,6 @@
   "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-23T07:17:54.084Z",
-  "updatedAt": "2026-02-23T07:17:54.084Z",
+  "updatedAt": "2026-02-23T07:22:27.312Z",
   "exportVersion": 3
 }
