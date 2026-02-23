@@ -214,7 +214,37 @@ async function handleRequest(request, env, ctx) {
     return text("ok");
   }
 
+  let resolvedSiteLoaded = false;
+  let resolvedSite = null;
+  async function resolveSiteOnce() {
+    if (resolvedSiteLoaded) {
+      return resolvedSite;
+    }
+    resolvedSiteLoaded = true;
+    if (!hostSlug || hostSlug === apiEntrySlug || reservedSlugs.has(hostSlug)) {
+      resolvedSite = null;
+      return resolvedSite;
+    }
+    resolvedSite = await getSiteBySlug(env, hostSlug);
+    return resolvedSite;
+  }
+
   if (path.startsWith("/api/")) {
+    const reservedHostPassthrough = Boolean(
+      hostSlug && reservedSlugs.has(hostSlug) && hostSlug !== apiEntrySlug
+    );
+    if (reservedHostPassthrough) {
+      return fetch(request);
+    }
+
+    const hostBelongsToStublogs = !hostSlug
+      || hostSlug === apiEntrySlug
+      || Boolean(await resolveSiteOnce());
+
+    if (!hostBelongsToStublogs) {
+      return fetch(request);
+    }
+
     if (request.method === "OPTIONS") {
       return buildApiPreflightResponse(request, env);
     }
@@ -267,13 +297,11 @@ async function handleRequest(request, env, ctx) {
     return html(renderRootAdminHelp(baseDomain), 200);
   }
 
-  const site = await getSiteBySlug(env, hostSlug);
+  const site = await resolveSiteOnce();
 
   if (!site) {
-    if (path === "/" || path === "/admin") {
-      return html(renderClaimPage(hostSlug, baseDomain), 200);
-    }
-    return notFound("Site not found");
+    // Host is not managed by stublogs. Pass through so other projects can respond.
+    return fetch(request);
   }
 
   if (path === "/admin") {
