@@ -4,7 +4,7 @@
   "description": "一句话介绍你自己",
   "heroTitle": "首頁標題",
   "heroSubtitle": "首頁副標",
-  "colorTheme": "default",
+  "colorTheme": "sunset",
   "footerNote": "頁尾文字",
   "customCss": "",
   "faviconUrl": "https://forum.rdfzer.com/letter_avatar_proxy/v4/letter/n/278dde/96.png",
@@ -13,6 +13,6 @@
   "hideCampusFeed": false,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T16:02:29.945Z",
-  "updatedAt": "2026-02-25T01:59:52.095Z",
+  "updatedAt": "2026-02-25T06:11:48.037Z",
   "exportVersion": 3
 }
