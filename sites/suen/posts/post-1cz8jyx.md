@@ -1,11 +1,3 @@
-+++
-date = "2026-02-22T20:24:00+08:00"
-draft = false
-title = "那麼，開學"
-slug = "202602"
-layout = "single"
-type = "blog"
-+++
 
 每年開學都從寫日曆開始，今年的寫法，嗯：
 
