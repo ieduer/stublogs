@@ -6,13 +6,13 @@
   "heroSubtitle": "",
   "colorTheme": "graphite",
   "footerNote": "我也不知道应该写点什么...",
-  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n    --font-mono: 'Maple Mono NF CN';\n    --font-sans: 'Maple Mono NF CN';\n}\n.panel {\n    background: transparent;\n    border: none;\n    box-shadow: none;\n}\n* {\n    --accent: rgb(116 178 243);\n    --bg-1: #11151b;\n    --bg-2: #181f29;\n    --ink: #d3dbe8;\n    --ink-2: #b4c0d0;\n    --muted: #8592a3;\n    --panel: rgba(24, 33, 43, .92);\n    --line: rgba(131, 154, 188, .14);\n    --accent-glow: rgba(149, 170, 202, .2);\n    --code-bg: rgba(149, 170, 202, .14);\n}\nblockquote {\n    background: none !important;\n}\n.post-item {\n    background: #1e1e1e;\n    border-radius: 10px;\n    padding: 20px;\n    box-shadow: rgb(21 21 21 / 72%) 0 6px 18px 0, rgb(137 135 135 / 24%) 0 0 0 1px;\n}\n.site-home-shell .link-button[href=\"/admin\"] {\n    display: none;\n}\n.reaction-btn {\n    background: #1e1e1e;\n}\n.reaction-label { color: var(--ink); }\n.article-wrap, .community-grid {\n    display: block;\n}\n.comment-list {\n    display: flex;\n    flex-direction: column-reverse;\n}",
+  "customCss": "@import url(\"https://fontsapi.zeoseven.com/442/main/result.css\");\n#theme-dock { display: none; }\nbody { \n    font-family: 'Maple Mono NF CN' !important; \n    background: rgb(27 27 30) !important;\n    --font-mono: 'Maple Mono NF CN' !important;\n    --font-sans: 'Maple Mono NF CN' !important;\n}\n.panel {\n    background: transparent;\n    border: none;\n    box-shadow: none;\n}\n* {\n    --accent: rgb(116 178 243) !important;\n    --bg-1: #11151b !important;\n    --bg-2: #181f29 !important;\n    --ink: #d3dbe8 !important;\n    --ink-2: #b4c0d0 !important;\n    --muted: #8592a3 !important;\n    --panel: rgba(24, 33, 43, .92) !important;\n    --line: rgba(131, 154, 188, .14) !important;\n    --accent-glow: rgba(149, 170, 202, .2) !important;\n    --code-bg: rgba(149, 170, 202, .14) !important;\n}\nblockquote {\n    background: none !important;\n}\n.post-item {\n    background: #1e1e1e;\n    border-radius: 10px;\n    padding: 20px;\n    box-shadow: rgb(21 21 21 / 72%) 0 6px 18px 0, rgb(137 135 135 / 24%) 0 0 0 1px;\n}\n.site-home-shell .link-button[href=\"/admin\"] {\n    display: none;\n}\n.reaction-btn {\n    background: #1e1e1e;\n}\n.reaction-label { color: var(--ink); }\n.article-wrap, .community-grid {\n    display: block;\n}\n.comment-list {\n    display: flex;\n    flex-direction: column-reverse;\n}",
   "faviconUrl": "https://www.tachyon.moe/image/cyan.png",
   "headerLinks": [],
   "hideCommunitySites": true,
   "hideCampusFeed": true,
   "commentsEnabled": true,
   "createdAt": "2026-02-21T15:08:41.048Z",
-  "updatedAt": "2026-02-26T01:02:23.199Z",
+  "updatedAt": "2026-02-26T01:05:51.407Z",
   "exportVersion": 3
 }
