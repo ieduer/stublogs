@@ -1,0 +1,60 @@
++++
+date = "2026-02-27T22:14:00+08:00"
+draft = false
+title = "那麼，開會"
+slug = "disgusting"
+layout = "single"
+type = "blog"
++++
+
+怎麼說呢，《論語．衛靈公》：「群居終日，言不及義。」嗯。  
+聊到自己對教育相關刻薄，周旋了幾秒，繼續寧做我。  
+
+昨天讓 OpenClaw 抓了 seiue 作業相關報文，寫了佈置作業腳本，今天優化了 OpenClaw 靈魂 MD 文件，組內評價模板出了後，提醒了下路徑後，OpenClaw 直接自己一次性成功導入，之後要求其分析評價模板和佈置任務的關係，OpenClaw 學會了如何根據評價佈置任務給學生，學會了如何批閱學生提交的作業，學會了如何不要被學生騙給分；正一切順意呢，突然，一串：
+
+![Screenshot 2026-02-27 at 06.31.28.png (20260227001)](https://img.bdfz.net/20260227001.webp)
+
+核查後發現，OpenClaw 給自己定了每 10 分鐘看所有學生提交作業的任務，我當時腦子沒細想就同意了，然後⋯⋯ 就炸了，OpenClaw 自己找了根因（已看日誌與 run history）：
+
+1. seiue-homework-auto-review 是每 10 分鐘跑一次，且提示詞超長、輸出超長。  
+2. 多次 run token 非常大（單輪到 10w+ 級別），很容易撞 provider rate limit。  
+3. 這個 job 開了 delivery.mode=announce，所以每次失敗都會自動往 Telegram 回一條錯誤。  
+4. 重啟後還會跑 missed job，等於在壓力期再補刀。  
+5. 你剛手動對話時也共用同一模型配額，所以你也被連帶打到 API rate limit reached。  
+
+修成 8 小時看一次，加了一個新的熔斷機制，好了。  
+因為這一念疏忽，多個重啟自啟機制被攪了個大亂，怎麼說呢，這就是把倚天劍，隨時割手那種：）  
+
+之前寫考勤腳本要自己抓包分析，隨便一個功能的工作量也是幾個小時，現在，OpenClaw 的 Skills 到位，剩下的，就是一句話⋯⋯  
+進化到此刻，AI 聊天框估計不需要太久都會升級到新型態了就。  
+說到底，模型三家開始就都知道 AI Agents 的玩法，只是不敢真設計更前沿的使用形態，也因此才有了 OpenClaw 空間。  
+對，對話從來只是開始，一直不是結束。  
+
+<blockquote class="twitter-tweet" data-media-max-width="560"><p lang="en" dir="ltr">It is hard to communicate how much programming has changed due to AI in the last 2 months: not gradually and over time in the &quot;progress as usual&quot; way, but specifically this last December. There are a number of asterisks but imo coding agents basically didn’t work before December…</p>&mdash; Andrej Karpathy (@karpathy) <a href="https://twitter.com/karpathy/status/2026731645169185220?ref_src=twsrc%5Etfw">February 25, 2026</a></blockquote> <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+
+---
+
+是啊，that era is over.   
+
+壞消息是前些天 Google 封了 Antigravity ，好消息是今天四個號都解了⋯⋯  
+但一則 OpenClaw 官方也取消了 Antigravity 授權入口，一則 Codex 確實夠強，兩個 OpenAI 付費號，本機一個，這個一個，正好。   
+
+風水確實在輪流轉，作惡為善可能也是。    
+OpenAI 的 CloseAI 帽子，我自己先給人家摘下，儘管後來買下了 OpenClaw，就這個允許命名，足夠甩 Claude 好幾條街。
+但你看 Claude 那麼不討人喜，也能硬剛什麼國家的破爛國防部組織，就，又真勇。  
+明明就是幾家 AI 公司，每天每天，美劇感十足。    
+
+需要說話就可以的，還有默寫網站。  
+這個確實需要說更多話，Apr 4, 2025 啟動這個網站時就加入過排位相關代碼，但一直沒想觸發，開學前，順手補了。  
+
+![Screenshot 2026-02-27 at 06.42.53.png (20260227002)](https://img.bdfz.net/20260227002.webp)
+
+基於 GPT-5.3-Codex 和 Claude Opus 4.6，雙管齊下，每小時一次提交，完工。  
+感謝兩個學生挑毛病，確認了所有功能正常運行。  
+
+![Screenshot 2026-02-27 at 05.31.02.png (20260227003)](https://img.bdfz.net/20260227003.webp)
+
+這網頁的使用人數真上來， 大概率需要 Workers Paid + KV Paid，倒也值得。   
+
+不夠專業的人真的有在敬業折騰，譬如把導生的平板使用記錄專門開發了開放給導師監控，簡直⋯⋯都可以用變態去形容了，譬如樓道斥罵學生成為今天會上德育榜樣，譬如滿嘴 AI 的其實真沒幾個得到切實助力⋯⋯ 不一而足，世界從來是劇本吧，也許。  
+好看，雖然不愛看。  
