@@ -30,8 +30,7 @@ type = "blog"
 說到底，模型三家開始就都知道 AI Agents 的玩法，只是不敢真設計更前沿的使用形態，也因此才有了 OpenClaw 空間。  
 對，對話從來只是開始，一直不是結束。  
 
-<blockquote class="twitter-tweet" data-media-max-width="560"><p lang="en" dir="ltr">It is hard to communicate how much programming has changed due to AI in the last 2 months: not gradually and over time in the &quot;progress as usual&quot; way, but specifically this last December. There are a number of asterisks but imo coding agents basically didn’t work before December…</p>&mdash; Andrej Karpathy (@karpathy) <a href="https://twitter.com/karpathy/status/2026731645169185220?ref_src=twsrc%5Etfw">February 25, 2026</a></blockquote> <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
-
+https://x.com/karpathy/status/2026731645169185220
 ---
 
 是啊，that era is over.   
