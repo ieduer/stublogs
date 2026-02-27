@@ -30,7 +30,7 @@ type = "blog"
 說到底，模型三家開始就都知道 AI Agents 的玩法，只是不敢真設計更前沿的使用形態，也因此才有了 OpenClaw 空間。  
 對，對話從來只是開始，一直不是結束。  
 
-https://x.com/karpathy/status/2026731645169185220
+https://x.com/karpathy/status/2026731645169185220?s=46
 ---
 
 是啊，that era is over.   
